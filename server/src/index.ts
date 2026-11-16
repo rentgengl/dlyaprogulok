@@ -38,6 +38,8 @@ const app = await buildApp({
   tiles: services.tiles,
   adminEmails: ADMIN_EMAILS(process.env),
   baseEnv: process.env,
+  pricing: services.pricing,
+  payments: services.payments,
 });
 
 if (overrideError) app.log.error(overrideError, 'Настройки из админки не применились, сервер работает на .env');
@@ -52,6 +54,11 @@ app.log.info(
   services.mailer
     ? `Почта: ${services.mailer.name}, подтверждение адреса обязательно`
     : 'Почта не настроена (SMTP_URL): подтверждение адреса не требуется',
+);
+app.log.info(
+  services.payments.provider
+    ? `Платежи: ${services.payments.provider}`
+    : 'Платежи выключены (PAYMENTS_PROVIDER): платные функции недоступны',
 );
 app.log.info(
   services.routeMonthlyLimit ? `Лимит: ${services.routeMonthlyLimit} маршрутов в месяц на пользователя` : 'Лимит маршрутов выключен',

@@ -24,7 +24,9 @@ import { passwordResetMail, verificationMail, type Mailer } from './mail.ts';
 import { factsSource, factsStory, mergeFacts, type Fact, type PlacePhoto } from './places.ts';
 import { legendSections, normalize, type GeoServices } from './services.ts';
 import { injectShareMeta, routeFacts } from './share.ts';
-import { servicesFromEnv, type Env, type Services } from './settings.ts';
+import { registerMoney, walletBrief } from './money.ts';
+import type { Pricing } from './pricing.ts';
+import { paymentsFromEnv, pricingFromEnv, servicesFromEnv, type Env, type PaymentsConfig, type Services } from './settings.ts';
 import type { TTS } from './tts.ts';
 
 const scrypt = promisify(scryptCb) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
@@ -93,6 +95,10 @@ export interface AppDeps {
   /** Сборка ИИ, озвучки и почты из настроек; в тестах подменяется. */
   reconfigure?: (env: Env) => Services;
   aiInfo?: { provider: string | null; model: string | null };
+  /** Цены платных действий; по умолчанию — значения из спецификации. */
+  pricing?: Pricing;
+  /** Платёжный шлюз; без него платные функции выключены и сервис работает как раньше. */
+  payments?: PaymentsConfig;
 }
 
 
@@ -227,6 +233,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   let monthlyLimit = deps.routeMonthlyLimit ?? 5;
   let tiles = deps.tiles;
   let aiInfo = deps.aiInfo ?? { provider: ai ? 'custom' : null, model: null };
+  let pricing = deps.pricing ?? pricingFromEnv({});
+  let payments = deps.payments ?? paymentsFromEnv({});
   const applyServices = (s: Services) => {
     ai = s.ai;
     tts = s.tts;
@@ -235,6 +243,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     monthlyLimit = s.routeMonthlyLimit;
     tiles = s.tiles;
     aiInfo = { provider: s.aiProvider, model: s.aiModel };
+    pricing = s.pricing;
+    payments = s.payments;
   };
   const adminEmails = (deps.adminEmails ?? []).map((e) => e.toLowerCase());
   if (adminEmails.length) {
@@ -302,7 +312,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const requireVerified = (req: FastifyRequest): User => {
     const user = requireUser(req);
     if (mailer && !user.emailVerified) {
-      throw new HttpError(403, `Подтвердите почту: ссылка в письме, отправленном на ${user.email}. Письмо можно отправить ещё раз в профиле.`);
+      throw new HttpError(
+        403,
+        `Подтвердите почту: ссылка в письме, отправленном на ${user.email}. Письмо можно отправить ещё раз в профиле.`,
+        'EMAIL_NOT_VERIFIED',
+      );
     }
     return user;
   };
@@ -338,7 +352,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     };
   }
 
-  const publicUser = (user: User) => ({ ...user, quota: quotaOf(user.id) });
+  const publicUser = (user: User) => ({ ...user, quota: quotaOf(user.id), wallet: walletBrief(db, user.id) });
 
   async function sendVerification(user: { id: string; email: string; name: string }, log: FastifyRequest['log']) {
     if (!mailer) return;
@@ -362,7 +376,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (err instanceof ZodError) {
       return reply.status(400).send({ error: err.issues[0]?.message ?? 'Некорректный запрос' });
     }
-    if (err instanceof HttpError) return reply.status(err.status).send({ error: err.message });
+    if (err instanceof HttpError) {
+      return reply.status(err.status).send({ ...err.extra, error: err.message, ...(err.code ? { code: err.code } : {}) });
+    }
     if (err.statusCode === 429) return reply.status(429).send({ error: 'Слишком много запросов, подождите немного' });
     if (err.code === 'FST_REQ_FILE_TOO_LARGE') return reply.status(413).send({ error: 'Файл слишком большой' });
     if (err.statusCode && err.statusCode < 500) return reply.status(err.statusCode).send({ error: err.message });
@@ -1804,6 +1820,17 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     await removeFiles([media.file_name]);
     touchRoute(route.id);
     return { route: fullRoute(loadRouteRow(route.id), user) };
+  });
+
+  registerMoney(app, {
+    db,
+    requireUser,
+    requireVerified,
+    monthWindow,
+    pricing: () => pricing,
+    payments: () => payments,
+    mailer: () => mailer,
+    appUrl: () => appUrl,
   });
 
   registerAdmin(app, {

@@ -21,7 +21,7 @@
 | Method | Path | Доступ | Назначение |
 |---|---|---|---|
 | GET | `/api/pricing` | все | Действующие цены и диапазоны: `{ route3h, story, narration2min, saleCommissionPct, payoutCommissionPct, routePrice: {min,max}, tip: {min,max}, topup: {min,max}, payoutMin, paymentsEnabled }` |
-| GET | `/api/wallet` | user | `{ balance, available, frozen, pendingPayout: PayoutRequest \| null, incomeThisMonth }` |
+| GET | `/api/wallet` | user | `{ balance, available, frozen, reserved, pendingPayout: PayoutRequest \| null, incomeThisMonth }`; `frozen` — заявка на вывод и возврат, `reserved` — идущая генерация |
 | GET | `/api/wallet/history?before=&limit=` | user | Операции пользователя, новые сверху: `{ items: [{ id, kind, amount, createdAt, title, route?: {id,title}, counterparty?: {id,name}, commission?, message? }], next }` |
 
 `GET /api/me` дополнительно отдаёт `wallet: { balance, available }` и прежний `quota`.

@@ -225,3 +225,62 @@ export function createTtsFromEnv(env: Env): TTS | null {
     voice: env.TTS_VOICE || 'alloy',
   });
 }
+
+// Битрейты (кбит/с) по индексу: [MPEG-1 слой I, II, III], [MPEG-2/2.5 слой I, II/III].
+const BITRATES_V1 = [
+  [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+  [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+  [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+];
+const BITRATES_V2 = [
+  [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+  [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+];
+const SAMPLE_RATES: Record<number, number[]> = { 3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000] };
+
+/**
+ * Длительность mp3 в секундах по MPEG-кадрам (без зависимостей): нужна, чтобы считать цену озвучки
+ * по факту. ID3v2 в начале пропускается; мусор между кадрами — пропускается побайтно.
+ * 0 — кадров не нашлось (не mp3).
+ */
+export function mp3DurationSec(buf: Buffer): number {
+  let i = 0;
+  if (buf.length >= 10 && buf.toString('latin1', 0, 3) === 'ID3') {
+    const size = ((buf[6]! & 0x7f) << 21) | ((buf[7]! & 0x7f) << 14) | ((buf[8]! & 0x7f) << 7) | (buf[9]! & 0x7f);
+    i = 10 + size + (buf[5]! & 0x10 ? 10 : 0);
+  }
+  let seconds = 0;
+  while (i + 4 <= buf.length) {
+    const b1 = buf[i + 1]!;
+    const b2 = buf[i + 2]!;
+    if (buf[i] !== 0xff || (b1 & 0xe0) !== 0xe0) {
+      i++;
+      continue;
+    }
+    const version = (b1 >> 3) & 3; // 3 — MPEG-1, 2 — MPEG-2, 0 — MPEG-2.5, 1 — зарезервировано
+    const layer = (b1 >> 1) & 3; // 3 — слой I, 2 — II, 1 — III
+    const bitrateIdx = b2 >> 4;
+    const rateIdx = (b2 >> 2) & 3;
+    const padding = (b2 >> 1) & 1;
+    if (version === 1 || layer === 0 || bitrateIdx === 0 || bitrateIdx === 15 || rateIdx === 3) {
+      i++;
+      continue;
+    }
+    const v1 = version === 3;
+    const layerNo = 4 - layer; // 1, 2, 3
+    const kbps = v1 ? BITRATES_V1[layerNo - 1]![bitrateIdx]! : BITRATES_V2[layerNo === 1 ? 0 : 1]![bitrateIdx]!;
+    const rate = SAMPLE_RATES[version]![rateIdx]!;
+    const samples = layerNo === 1 ? 384 : layerNo === 3 && !v1 ? 576 : 1152;
+    const length =
+      layerNo === 1
+        ? (Math.floor((12 * kbps * 1000) / rate) + padding) * 4
+        : Math.floor(((samples / 8) * kbps * 1000) / rate) + padding;
+    if (length < 4) {
+      i++;
+      continue;
+    }
+    seconds += samples / rate;
+    i += length;
+  }
+  return seconds;
+}

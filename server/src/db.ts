@@ -131,6 +131,137 @@ CREATE TABLE IF NOT EXISTS ratings (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (route_id, user_id)
 );
+
+-- ---------- Монетизация (specs/002-monetization/data-model.md) ----------
+-- Внешних ключей на users нет намеренно: учёт денег переживает удаление пользователя.
+
+-- Счёт пользователя в баллах; всегда равен сумме проводок по 'user:<id>'.
+CREATE TABLE IF NOT EXISTS wallets (
+  user_id TEXT PRIMARY KEY,
+  balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+  updated_at TEXT NOT NULL
+);
+
+-- Операция: kind topup | charge | route_purchase | tip | payout | refund.
+CREATE TABLE IF NOT EXISTS ledger_tx (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  actor_id TEXT,
+  ref_type TEXT,
+  ref_id TEXT,
+  meta TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ledger_tx_ref ON ledger_tx(ref_type, ref_id);
+
+-- Проводки, неизменяемые; по каждой операции сумма amount равна 0.
+CREATE TABLE IF NOT EXISTS ledger_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tx_id TEXT NOT NULL REFERENCES ledger_tx(id),
+  account TEXT NOT NULL,
+  amount INTEGER NOT NULL CHECK (amount != 0),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ledger_entries_account ON ledger_entries(account, id);
+CREATE INDEX IF NOT EXISTS ledger_entries_tx ON ledger_entries(tx_id);
+
+-- Резервы (charge — генерация, refund — возврат в обработке) и заморозки (payout — заявка на вывод).
+CREATE TABLE IF NOT EXISTS holds (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('charge', 'payout', 'refund')),
+  amount INTEGER NOT NULL CHECK (amount >= 0),
+  ref_type TEXT,
+  ref_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('active', 'captured', 'released')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS holds_user ON holds(user_id, status);
+CREATE INDEX IF NOT EXISTS holds_ref ON holds(ref_type, ref_id);
+
+-- Покупка баллов через ЮKassa; суммы в копейках.
+CREATE TABLE IF NOT EXISTS payments (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  points INTEGER NOT NULL CHECK (points > 0),
+  amount_kop INTEGER NOT NULL CHECK (amount_kop > 0),
+  status TEXT NOT NULL CHECK (status IN ('created', 'pending', 'succeeded', 'canceled', 'mismatch')),
+  provider_id TEXT UNIQUE,
+  confirmation_url TEXT,
+  refunded_kop INTEGER NOT NULL DEFAULT 0,
+  cancel_reason TEXT,
+  ledger_tx_id TEXT,
+  checked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS payments_user ON payments(user_id, created_at);
+CREATE INDEX IF NOT EXISTS payments_status ON payments(status, created_at);
+
+CREATE TABLE IF NOT EXISTS refunds (
+  id TEXT PRIMARY KEY,
+  payment_id TEXT NOT NULL REFERENCES payments(id),
+  points INTEGER NOT NULL CHECK (points > 0),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'succeeded', 'canceled')),
+  provider_id TEXT UNIQUE,
+  admin_id TEXT NOT NULL,
+  note TEXT,
+  hold_id TEXT,
+  ledger_tx_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS refunds_payment ON refunds(payment_id);
+
+-- Открытые платные маршруты. Без каскадного удаления: проданный маршрут не удаляется физически.
+CREATE TABLE IF NOT EXISTS route_purchases (
+  route_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  author_share INTEGER NOT NULL,
+  ledger_tx_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (route_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS route_purchases_user ON route_purchases(user_id);
+
+CREATE TABLE IF NOT EXISTS tips (
+  id TEXT PRIMARY KEY,
+  sender_id TEXT NOT NULL,
+  author_id TEXT NOT NULL,
+  route_id TEXT,
+  amount INTEGER NOT NULL CHECK (amount > 0),
+  author_share INTEGER NOT NULL,
+  message TEXT CHECK (message IS NULL OR length(message) <= 200),
+  ledger_tx_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK (sender_id != author_id)
+);
+CREATE INDEX IF NOT EXISTS tips_author ON tips(author_id, created_at);
+
+CREATE TABLE IF NOT EXISTS payout_requests (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  points INTEGER NOT NULL CHECK (points > 0),
+  fee_pct INTEGER NOT NULL,
+  payout_kop INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('open', 'paid', 'rejected')),
+  admin_note TEXT,
+  hold_id TEXT NOT NULL,
+  ledger_tx_id TEXT,
+  created_at TEXT NOT NULL,
+  decided_at TEXT,
+  decided_by TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS payout_requests_open ON payout_requests(user_id) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS payout_requests_status ON payout_requests(status, created_at);
+
+-- Служебные секреты сервера (ключ подписи ссылок на медиа). Не показываются в админке и API.
+CREATE TABLE IF NOT EXISTS app_secrets (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `;
 
 /** Колонки, добавленные после первого выпуска: у старых баз их нужно дописать. */
@@ -172,6 +303,24 @@ function migrate(db: DatabaseSync) {
   for (const col of ["role TEXT NOT NULL DEFAULT 'user'", 'blocked_at TEXT', 'route_limit INTEGER']) {
     if (!userColumns.includes(col.split(' ')[0]!)) db.exec(`ALTER TABLE users ADD COLUMN ${col}`);
   }
+  // Обезличенный аккаунт автора, у которого остались проданные маршруты.
+  if (!userColumns.includes('deleted_at')) db.exec('ALTER TABLE users ADD COLUMN deleted_at TEXT');
+
+  // Монетизация: цена и проверка платного маршрута; free_generation — создан в бесплатном лимите;
+  // deleted_at — удалён автором, но у маршрута есть покупатели.
+  const routeColumns = (db.prepare('PRAGMA table_info(routes)').all() as { name: string }[]).map((c) => c.name);
+  for (const col of [
+    'price INTEGER',
+    'sale_status TEXT',
+    'sale_note TEXT',
+    'sale_decided_at TEXT',
+    'sale_decided_by TEXT',
+    'free_generation INTEGER NOT NULL DEFAULT 0',
+    'deleted_at TEXT',
+  ]) {
+    if (!routeColumns.includes(col.split(' ')[0]!)) db.exec(`ALTER TABLE routes ADD COLUMN ${col}`);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS routes_catalog ON routes(is_public, sale_status, city)');
 }
 
 export function openDb(path: string): DatabaseSync {

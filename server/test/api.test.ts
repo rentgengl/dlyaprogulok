@@ -350,6 +350,8 @@ describe('экспорт и вспомогательное', () => {
     const file = path.join(dir, 'db.sqlite');
     const first = openDb(file);
     first.exec('DROP INDEX routes_city');
+    // Индекс каталога появился позже колонки city: в старой базе его тоже нет.
+    first.exec('DROP INDEX routes_catalog');
     first.exec('ALTER TABLE routes DROP COLUMN city');
     first.close();
     const again = openDb(file);
