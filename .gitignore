@@ -1,0 +1,10 @@
+node_modules/
+server/data/
+.env
+.DS_Store
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+.claude/settings.local.json
+/app/android

@@ -1,0 +1,11 @@
+services:
+  tts:
+    build: ./tts
+    image: rasskazhi-tts:local
+    # Порт открыт только на этой машине: ключа по умолчанию нет.
+    ports:
+      - "127.0.0.1:8880:8880"
+    environment:
+      DEFAULT_VOICE: denis
+      # API_KEY: задайте, если сервис будет доступен из сети, и такой же TTS_API_KEY на сервере
+    restart: unless-stopped

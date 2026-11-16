@@ -1,0 +1,64 @@
+{
+  "expo": {
+    "name": "Для прогулок",
+    "slug": "rasskazhi",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.rasskazhi",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Чтобы начать маршрут от того места, где вы находитесь."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#24483E",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "app.rasskazhi"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false,
+          "enableBackgroundPlayback": true
+        }
+      ],
+      "expo-video",
+      "expo-secure-store",
+      "expo-splash-screen",
+      "expo-status-bar",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Чтобы начать маршрут от того места, где вы находитесь."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Чтобы прикреплять фото и видео к точкам маршрута.",
+          "cameraPermission": false,
+          "microphonePermission": false
+        }
+      ],
+      "expo-font",
+      "expo-asset",
+      "expo-sharing"
+    ],
+    "scheme": "rasskazhi"
+  }
+}

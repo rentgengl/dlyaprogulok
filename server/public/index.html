@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Карта</title>
+<base target="_blank" />
+<link rel="stylesheet" href="/map/leaflet/leaflet.css" />
+<style>
+  html, body, #map { height: 100%; margin: 0; background: #e8e4d9; }
+  .stop {
+    width: 30px; height: 30px; box-sizing: border-box; border-radius: 50%;
+    background: #24483e; color: #fff; border: 2px solid #fff;
+    display: flex; align-items: center; justify-content: center;
+    font: 700 14px/1 -apple-system, system-ui, sans-serif;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .stop.selected { background: #c8553d; transform: scale(1.2); }
+  .start {
+    width: 18px; height: 18px; box-sizing: border-box; border-radius: 50%;
+    background: #fff; border: 5px solid #c8553d; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .finish {
+    width: 22px; height: 22px; box-sizing: border-box; border-radius: 4px;
+    border: 2px solid #24483e; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+    background: repeating-conic-gradient(#24483e 0 25%, #fff 0 50%) 0 0 / 9px 9px;
+  }
+  .draft {
+    width: 30px; height: 30px; box-sizing: border-box; border-radius: 50%;
+    background: #fff; color: #c8553d; border: 3px dashed #c8553d;
+    display: flex; align-items: center; justify-content: center;
+    font: 700 18px/1 -apple-system, system-ui, sans-serif;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .route-start {
+    width: 30px; height: 30px; box-sizing: border-box; border-radius: 50% 50% 50% 0;
+    position: relative; transform: rotate(-45deg); background: #c8553d; border: 2px solid #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  .route-start::after {
+    content: ''; position: absolute; left: 8px; top: 8px; width: 10px; height: 10px;
+    border-radius: 50%; background: #fff;
+  }
+  .route-start.selected { background: #24483e; }
+  .route-group {
+    box-sizing: border-box; border-radius: 50%;
+    background: #c8553d; color: #fff; border: 3px solid rgba(255,255,255,.9);
+    display: flex; align-items: center; justify-content: center;
+    font: 700 15px/1 -apple-system, system-ui, sans-serif;
+    box-shadow: 0 0 0 5px rgba(200,85,61,.25), 0 1px 4px rgba(0,0,0,.4);
+  }
+  .route-group.selected { background: #24483e; box-shadow: 0 0 0 5px rgba(36,72,62,.25), 0 1px 4px rgba(0,0,0,.4); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="/map/leaflet/leaflet.js"></script>
+<script>
+  // Страница работает и в iframe (web), и в WebView (iOS/Android).
+  // Названия точек пишут другие пользователи, поэтому в DOM они попадают только через textContent.
+  const map = L.map('map', { zoomControl: false }).setView([55.7558, 37.6173], 12);
+  L.control.zoom({ position: 'bottomright' }).addTo(map);
+  const layer = L.layerGroup().addTo(map);
+  // Старты маршрутов (вид каталога на карте): группируются заново при каждом зуме.
+  const startsLayer = L.layerGroup().addTo(map);
+  let starts = [];
+  let selectedStarts = [];
+  let lastFitKey = null;
+  const GROUP_PX = 44;
+
+  fetch('/api/config').then((r) => r.json()).then((cfg) => {
+    L.tileLayer(cfg.tiles.url, {
+      maxZoom: 19,
+      attribution: cfg.tiles.attribution,
+      referrerPolicy: 'strict-origin-when-cross-origin',
+    }).addTo(map);
+  });
+
+  function send(msg) {
+    const text = JSON.stringify(msg);
+    if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(text);
+    else window.parent.postMessage(text, '*');
+  }
+
+  // Жадная группировка в пикселях текущего зума: точка попадает в первую группу,
+  // центр которой ближе GROUP_PX. Для сотен маршрутов этого достаточно.
+  function groupStarts() {
+    const zoom = map.getZoom();
+    const groups = [];
+    starts.forEach((r) => {
+      const px = map.project([r.lat, r.lng], zoom);
+      const g = groups.find((g) => g.px.distanceTo(px) < GROUP_PX);
+      if (g) {
+        g.items.push(r);
+        // Центр группы — среднее её точек.
+        g.px = g.px.multiplyBy(g.items.length - 1).add(px).divideBy(g.items.length);
+      } else {
+        groups.push({ px, items: [r] });
+      }
+    });
+    return groups;
+  }
+
+  function drawStarts() {
+    startsLayer.clearLayers();
+    const zoom = map.getZoom();
+    groupStarts().forEach((g) => {
+      const ids = g.items.map((r) => r.id);
+      const selected = ids.some((id) => selectedStarts.includes(id));
+      const at = map.unproject(g.px, zoom);
+      if (g.items.length === 1) {
+        const r = g.items[0];
+        const marker = L.marker([r.lat, r.lng], {
+          icon: L.divIcon({
+            className: '',
+            html: '<div class="route-start' + (selected ? ' selected' : '') + '"></div>',
+            iconSize: [30, 30],
+            iconAnchor: [15, 34],
+          }),
+          zIndexOffset: selected ? 1000 : 0,
+        }).addTo(startsLayer);
+        const label = document.createElement('span');
+        label.textContent = String(r.title);
+        marker.bindTooltip(label, { direction: 'top', offset: [0, -34] });
+        marker.on('click', () => send({ type: 'routes', ids }));
+        return;
+      }
+      const size = g.items.length < 10 ? 38 : g.items.length < 100 ? 44 : 52;
+      const marker = L.marker(at, {
+        icon: L.divIcon({
+          className: '',
+          html: '<div class="route-group' + (selected ? ' selected' : '') + '" style="width:' + size + 'px;height:' + size + 'px">' + g.items.length + '</div>',
+          iconSize: [size, size],
+          iconAnchor: [size / 2, size / 2],
+        }),
+        zIndexOffset: 500 + (selected ? 1000 : 0),
+      }).addTo(startsLayer);
+      const label = document.createElement('span');
+      label.textContent = pluralRoutes(g.items.length) + ' рядом';
+      marker.bindTooltip(label, { direction: 'top', offset: [0, -size / 2] });
+      marker.on('click', () => {
+        // Пока группа распадается при приближении — приближаем; если старты почти совпадают,
+        // разделить их зумом нельзя, и показываем список.
+        const maxZoom = map.getMaxZoom();
+        const first = map.project([g.items[0].lat, g.items[0].lng], maxZoom);
+        const splits = g.items.some((r) => map.project([r.lat, r.lng], maxZoom).distanceTo(first) >= GROUP_PX);
+        if (!splits || zoom >= maxZoom) {
+          send({ type: 'routes', ids });
+          return;
+        }
+        const bounds = L.latLngBounds(g.items.map((r) => [r.lat, r.lng]));
+        map.flyToBounds(bounds, { padding: [80, 80], maxZoom, duration: 0.5 });
+      });
+    });
+  }
+
+  function pluralRoutes(n) {
+    const d10 = n % 10, d100 = n % 100;
+    if (d10 === 1 && d100 !== 11) return n + ' маршрут';
+    if (d10 >= 2 && d10 <= 4 && (d100 < 12 || d100 > 14)) return n + ' маршрута';
+    return n + ' маршрутов';
+  }
+
+  map.on('zoomend', drawStarts);
+
+  function render(s) {
+    layer.clearLayers();
+    const bounds = [];
+    starts = (s.starts || []).filter((r) => Number.isFinite(r.lat) && Number.isFinite(r.lng));
+    selectedStarts = s.selectedStarts || [];
+    starts.forEach((r) => bounds.push([r.lat, r.lng]));
+    drawStarts();
+    if (s.geometry && s.geometry.length > 1) {
+      L.polyline(s.geometry, { color: '#24483e', weight: 4, opacity: 0.8 }).addTo(layer);
+      s.geometry.forEach((p) => bounds.push(p));
+    }
+    if (s.start) {
+      L.marker([s.start.lat, s.start.lng], {
+        icon: L.divIcon({ className: '', html: '<div class="start"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }),
+        interactive: false,
+      }).addTo(layer);
+      bounds.push([s.start.lat, s.start.lng]);
+    }
+    (s.points || []).forEach((p, i) => {
+      const cls = p.id === s.selectedId ? 'stop selected' : 'stop';
+      const marker = L.marker([p.lat, p.lng], {
+        icon: L.divIcon({ className: '', html: '<div class="' + cls + '">' + (i + 1) + '</div>', iconSize: [30, 30], iconAnchor: [15, 15] }),
+        zIndexOffset: p.id === s.selectedId ? 1000 : 0,
+      }).addTo(layer);
+      const label = document.createElement('span');
+      label.textContent = String(p.name);
+      marker.bindTooltip(label, { direction: 'top', offset: [0, -14] });
+      marker.on('click', () => send({ type: 'marker', id: p.id }));
+      bounds.push([p.lat, p.lng]);
+    });
+    if (s.finish) {
+      L.marker([s.finish.lat, s.finish.lng], {
+        icon: L.divIcon({ className: '', html: '<div class="finish"></div>', iconSize: [22, 22], iconAnchor: [11, 11] }),
+        interactive: false,
+      }).addTo(layer);
+      bounds.push([s.finish.lat, s.finish.lng]);
+    }
+    if (s.draft) {
+      L.marker([s.draft.lat, s.draft.lng], {
+        icon: L.divIcon({ className: '', html: '<div class="draft">+</div>', iconSize: [30, 30], iconAnchor: [15, 15] }),
+        interactive: false,
+        zIndexOffset: 2000,
+      }).addTo(layer);
+    }
+    // Подгоняем вид только при смене данных, чтобы выбор точки не сбрасывал зум пользователя.
+    const key = s.fitKey ?? JSON.stringify(bounds);
+    if (key !== lastFitKey && bounds.length) {
+      lastFitKey = key;
+      if (bounds.length === 1) map.setView(bounds[0], 15);
+      else map.fitBounds(bounds, { padding: [40, 40] });
+    } else if (key !== lastFitKey && s.center) {
+      lastFitKey = key;
+      map.setView([s.center.lat, s.center.lng], 12);
+    }
+  }
+
+  map.on('click', (e) => send({ type: 'press', lat: e.latlng.lat, lng: e.latlng.lng }));
+
+  // Нативное приложение вызывает window.__render через injectJavaScript.
+  window.__render = render;
+  window.addEventListener('message', (e) => {
+    if (e.source !== window.parent) return;
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'render') render(msg.state);
+    } catch {}
+  });
+  send({ type: 'ready' });
+</script>
+</body>
+</html>
