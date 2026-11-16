@@ -66,7 +66,7 @@ SQLite, миграции — в `server/src/db.ts` (`CREATE TABLE IF NOT EXISTS`
 | user_id | TEXT NOT NULL | |
 | kind | TEXT NOT NULL | `charge` (генерация), `payout` (заявка на вывод), `refund` (возврат платежа в обработке) |
 | amount | INTEGER NOT NULL | `> 0`; уменьшается по мере списания частями |
-| ref_type, ref_id | TEXT | `job` / `point` / `payout` и id |
+| ref_type, ref_id | TEXT | `job` (фоновая задача), `request` (синхронный запрос), `point`, `payout`, `refund` и id |
 | status | TEXT NOT NULL | `active` → `captured` \| `released` |
 | created_at, updated_at | TEXT NOT NULL | |
 
@@ -174,7 +174,7 @@ PK `(route_id, user_id)` — повторная покупка невозмож�
 Состояния продажи:
 
 ```text
-NULL ──автор включил цену──▶ pending ──одобрено──▶ approved ──снят──▶ delisted
+NULL ──автор включил цену──▶ pending ──одобрено (is_public=1)──▶ approved ──снят──▶ delisted
                                 │                     │  ▲              │
                                 │                     │  └─автор снова──┘ (через pending)
                                 └──отклонено──▶ rejected (is_public=0, price=NULL)

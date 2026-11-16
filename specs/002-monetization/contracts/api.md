@@ -108,7 +108,7 @@
 | GET | `/api/admin/money/ledger?user=&kind=&from=&to=` | Операции |
 | POST | `/api/admin/money/payments/:id/refund` | `{ points, note }` — возврат через ЮKassa (FR-028); `≤` остатка платежа и доступного у пользователя |
 | GET | `/api/admin/paid-routes?status=pending` | Очередь проверки |
-| POST | `/api/admin/paid-routes/:id/decision` | `{ decision: 'approve' \| 'reject' \| 'delist', note }`; `note` обязателен для reject/delist; письмо автору |
+| POST | `/api/admin/paid-routes/:id/decision` | `{ decision: 'approve' \| 'reject' \| 'delist', note }`; `note` обязателен для reject/delist; `approve` публикует маршрут (`is_public = 1`); письмо автору |
 | GET | `/api/admin/payouts?status=open` | Заявки на вывод с историей дохода пользователя |
 | POST | `/api/admin/payouts/:id/decision` | `{ decision: 'paid' \| 'rejected', note }`; письмо пользователю |
 | GET/PUT | `/api/admin/settings` | Без изменений; новая группа «Монетизация» (см. data-model) |
