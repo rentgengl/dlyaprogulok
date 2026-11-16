@@ -40,7 +40,7 @@
 
 | Method | Path | Изменение |
 |---|---|---|
-| GET | `/api/routes/quote?durationMin=&distanceM=` | **новый**: `{ free: boolean, freeLeft, limit, cost }` — для экрана создания |
+| GET | `/api/routes/quote?durationMin=&distanceM=&roundTrip=` | **новый**: `{ free: boolean, freeLeft, limit, cost, paymentsEnabled }` — для экрана создания; при `paymentsEnabled = false` и исчерпанном лимите подбор недоступен, как раньше |
 | POST | `/api/routes/generate` | + `expectedCost` (обязателен, если маршрут не бесплатный). Бесплатный: как сейчас, `autoStories` работает. Платный: ставит резерв на цену маршрута; `autoStories` игнорируется, ответ содержит `notice` о том, что рассказы заказываются отдельно |
 | POST | `/api/routes/:id/stories` | + `expectedCost` (обязателен для платного). Ответ `202 { job, cost }` |
 | GET | `/api/routes/:id/stories/quote?style=&redo=` | **новый**: `{ cost, points, items: [{ pointId, story, narrationEstimate }] }`; `cost = 0`, если идёт бесплатная первоначальная генерация |

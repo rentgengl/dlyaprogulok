@@ -70,8 +70,8 @@ export function createJobRunner(
 
   const get = (id: string) => db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
 
-  function enqueue(userId: string, kind: JobKind, params: unknown, routeId: string | null = null): JobRow {
-    const id = randomUUID();
+  /** id можно задать заранее: к нему привязывается резерв баллов, созданный до запуска задачи. */
+  function enqueue(userId: string, kind: JobKind, params: unknown, routeId: string | null = null, id: string = randomUUID()): JobRow {
     const ts = now();
     db.prepare(
       `INSERT INTO jobs (id, user_id, kind, status, params, route_id, created_at, updated_at)

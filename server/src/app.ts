@@ -24,10 +24,19 @@ import { passwordResetMail, verificationMail, type Mailer } from './mail.ts';
 import { factsSource, factsStory, mergeFacts, type Fact, type PlacePhoto } from './places.ts';
 import { legendSections, normalize, type GeoServices } from './services.ts';
 import { injectShareMeta, routeFacts } from './share.ts';
-import { registerMoney, walletBrief } from './money.ts';
-import type { Pricing } from './pricing.ts';
+import { capture, findHold, hold, release, userAccount } from './ledger.ts';
+import { checkExpected, registerMoney, requireSpender, walletBrief, type MoneyContext } from './money.ts';
+import {
+  narrationCost,
+  quoteTotal,
+  routeCost,
+  routeMinutes,
+  storyItemQuote,
+  type Pricing,
+  type StoryQuoteItem,
+} from './pricing.ts';
 import { paymentsFromEnv, pricingFromEnv, servicesFromEnv, type Env, type PaymentsConfig, type Services } from './settings.ts';
-import type { TTS } from './tts.ts';
+import { mp3DurationSec, type TTS } from './tts.ts';
 
 const scrypt = promisify(scryptCb) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -197,6 +206,8 @@ const generateSchema = z
     background: z.boolean().default(false),
     /** Для фоновой задачи: сразу создать рассказы и озвучку для всех точек. */
     autoStories: z.boolean().default(false),
+    /** Цена, которую пользователь видел и подтвердил (для подбора сверх бесплатного лимита). */
+    expectedCost: z.number().int().min(0).optional(),
   })
   .refine((v) => (v.durationMin === undefined) !== (v.distanceM === undefined), {
     message: 'Укажите либо длительность, либо длину маршрута',
@@ -321,6 +332,50 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return user;
   };
 
+  const moneyCtx: MoneyContext = {
+    db,
+    requireUser,
+    requireVerified,
+    monthWindow,
+    pricing: () => pricing,
+    payments: () => payments,
+    mailer: () => mailer,
+    appUrl: () => appUrl,
+    log: app.log,
+  };
+  /** Платные действия включены, только когда подключён платёжный шлюз; иначе всё как до монетизации. */
+  const charging = () => !!payments.provider;
+
+  /** Списание из резерва за готовый результат: проводка «пользователь → выручка». */
+  function captureCharge(
+    holdId: string,
+    userId: string,
+    amount: number,
+    ref: { type: string; id: string },
+    meta: { title: string; routeId?: string; routeTitle?: string },
+    close = false,
+  ) {
+    tx(db, () =>
+      capture(
+        db,
+        holdId,
+        amount,
+        {
+          kind: 'charge',
+          actorId: userId,
+          refType: ref.type,
+          refId: ref.id,
+          meta,
+          entries: [
+            { account: userAccount(userId), amount: -amount },
+            { account: 'sys:revenue', amount },
+          ],
+        },
+        { close },
+      ),
+    );
+  }
+
   /** Свой лимит пользователя, иначе общий; 0 — без ограничения. */
   function limitOf(userId: string): number {
     const row = db.prepare('SELECT route_limit FROM users WHERE id = ?').get(userId) as any;
@@ -429,6 +484,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       .get(id);
   }
 
+  /** Задача для клиента: с режимом оплаты, списанным и зарезервированным. */
+  function jobView(row: JobRow) {
+    const params = JSON.parse(row.params) as { billing?: 'free' | 'paid' };
+    const charged = (
+      db
+        .prepare(
+          `SELECT COALESCE(SUM(e.amount), 0) AS s FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+           WHERE t.ref_type = 'job' AND t.ref_id = ? AND e.account = 'sys:revenue'`,
+        )
+        .get(row.id) as { s: number }
+    ).s;
+    return { ...serializeJob(row), billing: params.billing ?? 'free', charged, reserved: findHold(db, 'job', row.id)?.amount ?? 0 };
+  }
+
   /** Задача по маршруту: идущая или закончившаяся за последние 15 минут. */
   function routeJob(routeId: string) {
     const row = db
@@ -437,7 +506,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
          ORDER BY created_at DESC LIMIT 1`,
       )
       .get(routeId, new Date(Date.now() - 15 * 60_000).toISOString()) as JobRow | undefined;
-    return row ? serializeJob(row) : null;
+    return row ? jobView(row) : null;
   }
 
   function fullRoute(row: any, viewer: User | null) {
@@ -843,34 +912,92 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   // ---------- Фоновые задачи ----------
 
-  /** Рассказы для точек без текста; redo — и для точек с рассказом другого направления (кроме текстов автора). */
-  async function storiesJob(job: JobRow, ctl: JobControl, routeId: string, params: { style?: string; redo?: boolean }) {
-    const route0 = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
-    if (!route0) throw new HttpError(404, 'Маршрут удалён');
-    const style = params.style ?? route0.story_style ?? 'facts';
-    const todo = routePoints(routeId).filter(
-      (p) => !p.story || (params.redo && p.story_source !== 'author' && (p.story_style ?? 'facts') !== style),
-    );
-    // После перезапуска сервера: готовые точки уже не в списке, счётчик продолжается.
-    let { done, failed } = job;
-    ctl.update({ stage: 'stories', total: done + todo.length });
-    for (const p of todo) {
-      if (!ctl.exists()) return;
-      const point = db.prepare('SELECT * FROM points WHERE id = ?').get(p.id) as any;
-      const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
-      if (!route) return;
-      if (point) {
-        try {
-          const res = await writePointStory(point, route, { style }, ctl.log);
-          res.notices.forEach((n) => ctl.notice(n));
-        } catch (err: any) {
-          failed++;
-          ctl.log.warn(err);
-          ctl.notice(`Не удалось создать рассказ для «${point.name}»: ${err?.status && err.status < 500 ? err.message : 'попробуйте ещё раз'}`);
+  /** Точки, для которых задача рассказов пишет текст: без рассказа; redo — и с рассказом другого направления (кроме текстов автора). */
+  const storyTodo = (routeId: string, style: string, redo: boolean) =>
+    routePoints(routeId).filter((p) => !p.story || (redo && p.story_source !== 'author' && (p.story_style ?? 'facts') !== style));
+
+  /** Оценка рассказов маршрута: текст + озвучка для каждой точки из storyTodo. */
+  function storiesQuote(route: any, style: string, redo: boolean) {
+    const items = storyTodo(route.id, style, redo).map((p) => ({
+      pointId: p.id as string,
+      ...storyItemQuote(pricing, { writeStory: true, withNarration: !!tts }),
+    }));
+    return { cost: quoteTotal(items), items };
+  }
+
+  /** Оценка для одной точки: новый текст (+ озвучка) или только озвучка текущего текста. */
+  const pointStoryQuote = (point: any, keepText: boolean): StoryQuoteItem =>
+    storyItemQuote(pricing, { writeStory: !keepText, textChars: (point.story ?? '').length, withNarration: !!tts });
+
+  /**
+   * Сколько списать за результат по точке: текст — если создан, озвучка — по фактической длительности,
+   * но не дороже оценки (FR-007); если длительность не определилась, — по оценке.
+   */
+  function pointCharge(res: { storyCreated: boolean; narrationSec: number | null }, est: StoryQuoteItem): number {
+    const story = res.storyCreated ? est.story : 0;
+    const narration =
+      res.narrationSec === null ? 0 : Math.min(res.narrationSec > 0 ? narrationCost(res.narrationSec, pricing) : est.narrationEstimate, est.narrationEstimate);
+    return story + narration;
+  }
+
+  interface StoriesParams {
+    style?: string;
+    redo?: boolean;
+    billing?: 'free' | 'paid';
+    /** Платная задача: точки и оценки, которые пользователь видел и подтвердил. */
+    pointIds?: string[];
+    estimates?: Record<string, StoryQuoteItem>;
+  }
+
+  /** Рассказы для точек маршрута; в платной задаче — списание по каждой точке из резерва задачи. */
+  async function storiesJob(job: JobRow, ctl: JobControl, routeId: string, params: StoriesParams) {
+    const paid = params.billing === 'paid';
+    try {
+      const route0 = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
+      if (!route0) throw new HttpError(404, 'Маршрут удалён');
+      const style = params.style ?? route0.story_style ?? 'facts';
+      let todo = storyTodo(routeId, style, !!params.redo);
+      // Платная задача делает только то, что было в подтверждённой цене.
+      if (paid) todo = todo.filter((p) => params.pointIds?.includes(p.id));
+      // После перезапуска сервера: готовые точки уже не в списке, счётчик продолжается.
+      let { done, failed } = job;
+      ctl.update({ stage: 'stories', total: done + todo.length });
+      for (const p of todo) {
+        if (!ctl.exists()) return;
+        const point = db.prepare('SELECT * FROM points WHERE id = ?').get(p.id) as any;
+        const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
+        if (!route) return;
+        if (point) {
+          try {
+            const res = await writePointStory(point, route, { style }, ctl.log);
+            res.notices.forEach((n) => ctl.notice(n));
+            const h = paid ? findHold(db, 'job', job.id) : undefined;
+            const est = params.estimates?.[point.id];
+            if (h && est) {
+              const amount = Math.min(h.amount, pointCharge(res, est));
+              if (amount > 0) {
+                captureCharge(h.id, job.user_id, amount, { type: 'job', id: job.id }, {
+                  title: `Рассказ: ${point.name}`,
+                  routeId,
+                  routeTitle: route.title,
+                });
+              }
+            }
+          } catch (err: any) {
+            failed++;
+            ctl.log.warn(err);
+            ctl.notice(`Не удалось создать рассказ для «${point.name}»: ${err?.status && err.status < 500 ? err.message : 'попробуйте ещё раз'}`);
+          }
         }
+        done++;
+        ctl.update({ done, failed });
       }
-      done++;
-      ctl.update({ done, failed });
+    } finally {
+      // Остаток резерва — за точки, где ничего не создалось, и за озвучку дешевле оценки.
+      if (paid) {
+        const h = findHold(db, 'job', job.id);
+        if (h) release(db, h.id);
+      }
     }
   }
 
@@ -878,18 +1005,40 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     db,
     {
       generate: async (job, ctl) => {
-        const params = JSON.parse(job.params) as { request: z.infer<typeof generateSchema>; autoStories: boolean };
+        const params = JSON.parse(job.params) as {
+          request: z.infer<typeof generateSchema>;
+          autoStories: boolean;
+          billing?: 'free' | 'paid';
+          notices?: string[];
+        };
+        const paid = params.billing === 'paid';
         let routeId = job.route_id;
         if (!routeId) {
-          ctl.update({ stage: 'planning' });
-          const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(job.user_id);
-          if (!userRow) throw new HttpError(404, 'Пользователь удалён');
-          const built = await buildRoute(toUser(userRow), params.request, ctl.log);
-          built.notices.forEach((n) => ctl.notice(n));
-          routeId = built.id;
-          ctl.update({ route_id: routeId });
+          try {
+            ctl.update({ stage: 'planning' });
+            const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(job.user_id);
+            if (!userRow) throw new HttpError(404, 'Пользователь удалён');
+            const built = await buildRoute(toUser(userRow), params.request, ctl.log, { free: !paid });
+            built.notices.forEach((n) => ctl.notice(n));
+            params.notices?.forEach((n) => ctl.notice(n));
+            routeId = built.id;
+            ctl.update({ route_id: routeId });
+          } catch (err) {
+            // Маршрут не создан: резерв снимается, баллы возвращаются.
+            const h = paid ? findHold(db, 'job', job.id) : undefined;
+            if (h) release(db, h.id);
+            throw err;
+          }
         }
-        if (params.autoStories) await storiesJob({ ...job, route_id: routeId }, ctl, routeId, { style: params.request.storyStyle });
+        // После перезапуска резерв уже списан и не находится: второго списания нет.
+        const h = paid ? findHold(db, 'job', job.id) : undefined;
+        if (h) {
+          const title = (db.prepare('SELECT title FROM routes WHERE id = ?').get(routeId) as any)?.title ?? '';
+          captureCharge(h.id, job.user_id, h.amount, { type: 'job', id: job.id }, { title: 'Подбор маршрута', routeId, routeTitle: title }, true);
+        }
+        if (params.autoStories && !paid) {
+          await storiesJob({ ...job, route_id: routeId }, ctl, routeId, { style: params.request.storyStyle, billing: 'free' });
+        }
       },
       stories: async (job, ctl) => {
         if (!job.route_id) throw new HttpError(404, 'Маршрут удалён');
@@ -912,7 +1061,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.get('/api/jobs/:id', async (req) => {
     const user = requireUser(req);
     const { id } = paramsId.parse(req.params);
-    return { job: serializeJob(ownedJob(id, user)) };
+    return { job: jobView(ownedJob(id, user)) };
   });
 
   /** Идущие задачи и закончившиеся за последний час: для списка «Мои». */
@@ -923,7 +1072,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         `SELECT * FROM jobs WHERE user_id = ? AND (status IN ('queued', 'running') OR updated_at > ?) ORDER BY created_at DESC LIMIT 20`,
       )
       .all(user.id, new Date(Date.now() - 60 * 60_000).toISOString()) as unknown as JobRow[];
-    return { jobs: rows.map(serializeJob) };
+    return { jobs: rows.map(jobView) };
   });
 
   /** Рассказы для всех точек маршрута в фоне. Если задача по маршруту уже идёт — она и возвращается. */
@@ -933,22 +1082,81 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     async (req, reply) => {
       const user = requireUser(req);
       const { id } = paramsId.parse(req.params);
-      const body = z.object({ style: storyStyleSchema.optional(), redo: z.boolean().default(false) }).parse(req.body ?? {});
+      const body = z
+        .object({ style: storyStyleSchema.optional(), redo: z.boolean().default(false), expectedCost: z.number().int().min(0).optional() })
+        .parse(req.body ?? {});
       const route = ownedRoute(id, user);
       const running = db
         .prepare("SELECT * FROM jobs WHERE route_id = ? AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1")
         .get(id) as JobRow | undefined;
-      if (running) return reply.status(202).send({ job: serializeJob(running) });
-      const job = jobs.enqueue(user.id, 'stories', { style: body.style ?? route.story_style ?? 'facts', redo: body.redo }, id);
-      return reply.status(202).send({ job: serializeJob(job) });
+      if (running) return reply.status(202).send({ job: jobView(running), cost: 0 });
+      const style = body.style ?? route.story_style ?? 'facts';
+      const jobId = randomUUID();
+      let params: StoriesParams = { style, redo: body.redo, billing: 'free' };
+      let cost = 0;
+      if (charging()) {
+        requireSpender(moneyCtx, req);
+        const quote = storiesQuote(route, style, body.redo);
+        checkExpected(quote.cost, body.expectedCost);
+        cost = quote.cost;
+        params = {
+          ...params,
+          billing: 'paid',
+          pointIds: quote.items.map((i) => i.pointId),
+          estimates: Object.fromEntries(quote.items.map((i) => [i.pointId, { story: i.story, narrationEstimate: i.narrationEstimate }])),
+        };
+        // Резерв до постановки задачи: обработчик начинает работу сразу и должен его найти.
+        if (cost > 0) tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'job', refId: jobId }));
+      }
+      const job = jobs.enqueue(user.id, 'stories', params, id, jobId);
+      return reply.status(202).send({ job: jobView(job), cost });
     },
   );
+
+  app.get('/api/routes/:id/stories/quote', async (req) => {
+    const user = requireUser(req);
+    const { id } = paramsId.parse(req.params);
+    const q = z.object({ style: storyStyleSchema.optional(), redo: z.enum(['true', 'false']).optional() }).parse(req.query);
+    const route = ownedRoute(id, user);
+    const quote = storiesQuote(route, q.style ?? route.story_style ?? 'facts', q.redo === 'true');
+    return { cost: charging() ? quote.cost : 0, points: quote.items.length, items: charging() ? quote.items : [] };
+  });
+
+  /** Бесплатен ли подбор (в пределах месячного лимита) и сколько он стоит сверх лимита. */
+  function generationQuote(userId: string, target: { durationMin: number } | { distanceM: number }, roundTrip: boolean) {
+    const quota = quotaOf(userId);
+    const free = quota.remaining !== 0;
+    return {
+      free,
+      freeLeft: quota.remaining,
+      limit: quota.limit,
+      cost: free ? 0 : routeCost(routeMinutes(target, roundTrip), pricing),
+      paymentsEnabled: charging(),
+    };
+  }
+
+  app.get('/api/routes/quote', async (req) => {
+    const user = requireUser(req);
+    const q = z
+      .object({
+        durationMin: z.coerce.number().min(15).max(480).optional(),
+        distanceM: z.coerce.number().min(300).max(30_000).optional(),
+        roundTrip: z.enum(['true', 'false']).default('true'),
+      })
+      .refine((v) => (v.durationMin === undefined) !== (v.distanceM === undefined), {
+        message: 'Укажите либо длительность, либо длину маршрута',
+      })
+      .parse(req.query);
+    const target = q.durationMin !== undefined ? { durationMin: q.durationMin } : { distanceM: q.distanceM! };
+    return generationQuote(user.id, target, q.roundTrip === 'true');
+  });
 
   /** Подбор мест и запись маршрута; бросает HttpError, если мест нет или источники недоступны. */
   async function buildRoute(
     user: User,
     body: z.infer<typeof generateSchema>,
     log: FastifyBaseLogger,
+    opts: { free: boolean } = { free: true },
   ): Promise<{ id: string; notices: string[] }> {
     const target =
       body.durationMin !== undefined ? { durationMin: body.durationMin } : { distanceM: body.distanceM! };
@@ -1031,6 +1239,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         });
       });
       db.prepare('INSERT INTO route_generations (user_id, created_at) VALUES (?, ?)').run(user.id, ts);
+      // Маршрут в бесплатном лимите: рассказы и озвучка при создании тоже бесплатны.
+      if (opts.free) db.prepare('UPDATE routes SET free_generation = 1 WHERE id = ?').run(id);
     });
     return { id, notices: plan.notices };
   }
@@ -1042,11 +1252,22 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       const user = requireVerified(req);
       const body = generateSchema.parse(req.body);
       const before = quotaOf(user.id);
-      if (before.remaining === 0) {
+      const free = before.remaining !== 0;
+      if (!free && !charging()) {
         throw new HttpError(
           429,
           `В этом месяце создано ${before.used} из ${before.limit} маршрутов. Новые можно будет создать с ${ruDate(new Date(before.resetsAt))}. Пока можно менять уже созданные маршруты: добавлять места и менять порядок.`,
         );
+      }
+      // Сверх бесплатного лимита — за баллы: цена подтверждена пользователем и зарезервирована.
+      let cost = 0;
+      const extraNotices: string[] = [];
+      if (!free) {
+        requireSpender(moneyCtx, req);
+        const target = body.durationMin !== undefined ? { durationMin: body.durationMin } : { distanceM: body.distanceM! };
+        cost = routeCost(routeMinutes(target, body.roundTrip), pricing);
+        checkExpected(cost, body.expectedCost);
+        if (body.autoStories) extraNotices.push('Рассказы для мест можно заказать после создания маршрута: цена будет видна заранее.');
       }
       if (body.background) {
         const active = (
@@ -1055,11 +1276,37 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         if (active >= MAX_ACTIVE_JOBS) {
           throw new HttpError(429, `Уже строится ${active} маршрута. Дождитесь, пока они будут готовы.`);
         }
-        const job = jobs.enqueue(user.id, 'generate', { request: body, autoStories: body.autoStories });
-        return reply.status(202).send({ job: serializeJob(job), quota: quotaOf(user.id) });
+        const jobId = randomUUID();
+        // Резерв до постановки задачи: обработчик начинает работу сразу и должен его найти.
+        const h = cost > 0 ? tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'job', refId: jobId })) : null;
+        let job: JobRow;
+        try {
+          job = jobs.enqueue(
+            user.id,
+            'generate',
+            { request: body, autoStories: free && body.autoStories, billing: free ? 'free' : 'paid', notices: extraNotices },
+            null,
+            jobId,
+          );
+        } catch (err) {
+          if (h) release(db, h.id);
+          throw err;
+        }
+        return reply.status(202).send({ job: jobView(job), quota: quotaOf(user.id) });
       }
-      const { id, notices } = await buildRoute(user, body, req.log);
-      return reply.status(201).send({ route: fullRoute(loadRouteRow(id), user), notices, quota: quotaOf(user.id) });
+      const h = cost > 0 ? tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'request', refId: randomUUID() })) : null;
+      let built: { id: string; notices: string[] };
+      try {
+        built = await buildRoute(user, body, req.log, { free });
+      } catch (err) {
+        if (h) release(db, h.id);
+        throw err;
+      }
+      const row = loadRouteRow(built.id);
+      if (h) captureCharge(h.id, user.id, cost, { type: 'route', id: built.id }, { title: 'Подбор маршрута', routeId: built.id, routeTitle: row.title }, true);
+      return reply
+        .status(201)
+        .send({ route: fullRoute(row, user), notices: [...built.notices, ...extraNotices], quota: quotaOf(user.id) });
     },
   );
 
@@ -1536,7 +1783,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     route: any,
     opts: { keepText?: boolean; fresh?: boolean; style?: string },
     log: FastifyBaseLogger,
-  ): Promise<{ notices: string[]; reused: boolean }> {
+  ): Promise<{ notices: string[]; reused: boolean; storyCreated: boolean; narrationSec: number | null }> {
     const id: string = point.id;
     const keepText = !!opts.keepText;
     const body = { fresh: !!opts.fresh, style: opts.style };
@@ -1666,6 +1913,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       await dropNarration(id);
     }
 
+    // Длительность озвучки — для цены по факту; null — озвучки нет.
+    let narrationSec: number | null = null;
     if (tts) {
       try {
         if (sharedNarration) {
@@ -1674,12 +1923,14 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
             await copyFile(from, to);
             return (await stat(to)).size;
           });
+          narrationSec = mp3DurationSec(await readFile(from));
         } else {
           const audio = await tts.synthesize(story);
           await saveNarration(id, async (to) => {
             await writeFile(to, audio);
             return audio.length;
           });
+          narrationSec = mp3DurationSec(audio);
         }
       } catch (err) {
         log.error(err);
@@ -1698,7 +1949,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       }
     }
     touchRoute(route.id);
-    return { notices, reused };
+    return { notices, reused, storyCreated: !keepText, narrationSec };
   }
 
   app.post(
@@ -1713,14 +1964,51 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           style: storyStyleSchema.optional(),
           /** true — «Создать заново»: написать новый текст, а не брать готовый из другого маршрута. */
           fresh: z.boolean().default(false),
+          expectedCost: z.number().int().min(0).optional(),
         })
         .parse(req.body ?? {});
       const { keepText } = body;
       const { point, route } = ownedPoint(id, user);
-      const { notices, reused } = await writePointStory(point, route, { keepText, fresh: body.fresh, style: body.style }, req.log);
-      return { route: fullRoute(loadRouteRow(route.id), user), notices, reused };
+      let h: ReturnType<typeof hold> | null = null;
+      let est: StoryQuoteItem = { story: 0, narrationEstimate: 0 };
+      if (charging()) {
+        requireSpender(moneyCtx, req);
+        est = pointStoryQuote(point, keepText);
+        const cost = est.story + est.narrationEstimate;
+        checkExpected(cost, body.expectedCost);
+        if (cost > 0) h = tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'point', refId: randomUUID() }));
+      }
+      let result: Awaited<ReturnType<typeof writePointStory>>;
+      try {
+        result = await writePointStory(point, route, { keepText, fresh: body.fresh, style: body.style }, req.log);
+      } catch (err) {
+        if (h) release(db, h.id);
+        throw err;
+      }
+      let charged = 0;
+      if (h) {
+        charged = Math.min(h.amount, pointCharge(result, est));
+        if (charged > 0) {
+          captureCharge(h.id, user.id, charged, { type: 'point', id: point.id }, {
+            title: keepText ? `Озвучка: ${point.name}` : `Рассказ: ${point.name}`,
+            routeId: route.id,
+            routeTitle: route.title,
+          }, true);
+        } else release(db, h.id);
+      }
+      const { notices, reused } = result;
+      return { route: fullRoute(loadRouteRow(route.id), user), notices, reused, charged };
     },
   );
+
+  app.get('/api/points/:id/story/quote', async (req) => {
+    const user = requireUser(req);
+    const { id } = paramsId.parse(req.params);
+    const { keepText } = z.object({ keepText: z.enum(['true', 'false']).default('false') }).parse(req.query);
+    const { point } = ownedPoint(id, user);
+    const q = charging() ? pointStoryQuote(point, keepText === 'true') : { story: 0, narrationEstimate: 0 };
+    return { cost: q.story + q.narrationEstimate, story: q.story, narrationEstimate: q.narrationEstimate };
+  });
 
   // ---------- Ссылка на маршрут ----------
 
@@ -1822,16 +2110,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return { route: fullRoute(loadRouteRow(route.id), user) };
   });
 
-  registerMoney(app, {
-    db,
-    requireUser,
-    requireVerified,
-    monthWindow,
-    pricing: () => pricing,
-    payments: () => payments,
-    mailer: () => mailer,
-    appUrl: () => appUrl,
-  });
+  registerMoney(app, moneyCtx);
 
   registerAdmin(app, {
     db,
