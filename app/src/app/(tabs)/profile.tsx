@@ -60,6 +60,14 @@ export default function ProfileScreen() {
           </Text>
           {quota ? <Text style={layout.body}>{quota}</Text> : null}
         </View>
+        {user.wallet ? (
+          <Button
+            title={`Баллы: ${user.wallet.available}`}
+            variant="secondary"
+            icon="wallet-outline"
+            onPress={() => router.push('/wallet')}
+          />
+        ) : null}
         {user.isAdmin ? (
           <Button title="Админка" variant="secondary" icon="settings-outline" onPress={() => router.push('/admin')} />
         ) : null}

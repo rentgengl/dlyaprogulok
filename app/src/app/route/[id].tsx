@@ -5,6 +5,7 @@ import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Image, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { AddPlace, type AddMode } from '@/components/AddPlace';
+import { pluralPoints, usePriceConfirm, type PaidAction } from '@/components/PriceConfirm';
 import { endpointsText, EndpointsCard, type Draft, type EndpointTarget } from '@/components/Endpoints';
 import { ExportCard } from '@/components/ExportCard';
 import { ShareCard } from '@/components/ShareCard';
@@ -38,6 +39,8 @@ const SOURCE_NOTE: Record<StorySource, string> = {
   author: 'Текст автора маршрута.',
 };
 
+const NARRATION_NOTE = 'Озвучка оплачивается по фактической длительности, но не дороже этой цены.';
+
 const sourceLinkTitle = (url: string) => (url.includes('wikidata.org') ? 'Справка в Викиданных' : 'Статья-источник');
 
 export default function RouteScreen() {
@@ -59,6 +62,17 @@ export default function RouteScreen() {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [endpointEdit, setEndpointEdit] = useState<EndpointTarget | null>(null);
   const [ordering, setOrdering] = useState(false);
+  /** Цена рассказов для точек без них; null — неизвестна или не нужна. */
+  const [storiesCost, setStoriesCost] = useState<number | null>(null);
+  const priceConfirm = usePriceConfirm();
+  /** Сервер умеет озвучивать текст: без этого кнопки «Озвучить» нет (звучит голос устройства). */
+  const [ttsEnabled, setTtsEnabled] = useState(false);
+  useEffect(() => {
+    api
+      .config()
+      .then((c) => setTtsEnabled(c.ttsEnabled))
+      .catch(() => {});
+  }, []);
   // Перезагрузка при входе/выходе: от пользователя зависят isOwner и myRating.
   useEffect(() => {
     // До восстановления входа приватный маршрут ответил бы 404.
@@ -94,15 +108,31 @@ export default function RouteScreen() {
   };
 
   /** Рассказы для точек без текста или, при смене направления, для всех с рассказом другого направления. Делает сервер в фоне. */
-  const generateAllStories = useCallback(async (current: Route, redo = false) => {
-    setError(null);
-    try {
-      const { job } = await api.routeStories(current.id, { style: current.storyStyle, redo });
-      setRoute((r) => (r && r.id === current.id ? { ...r, job } : r));
-    } catch (err) {
-      setError(message(err));
-    }
-  }, []);
+  const generateAllStories = useCallback(
+    async (current: Route, redo = false) => {
+      setError(null);
+      try {
+        let quote = { cost: 0, points: 0 };
+        try {
+          quote = await api.storiesQuote(current.id, { style: current.storyStyle, redo });
+        } catch {
+          // Цену не узнали — если действие платное, сервер ответит новой ценой.
+        }
+        await priceConfirm.run({
+          title: quote.points ? `Рассказы для мест: ${quote.points}` : 'Рассказы для мест',
+          cost: quote.cost,
+          note: `${NARRATION_NOTE} Если рассказ для какого-то места не получится, баллы за него не спишутся.`,
+          perform: async (expectedCost) => {
+            const { job } = await api.routeStories(current.id, { style: current.storyStyle, redo, expectedCost });
+            setRoute((r) => (r && r.id === current.id ? { ...r, job } : r));
+          },
+        });
+      } catch (err) {
+        setError(message(err));
+      }
+    },
+    [priceConfirm.run],
+  );
 
   // Пока задача идёт, маршрут перечитывается: рассказы появляются по мере готовности.
   const job = route?.job ?? null;
@@ -117,6 +147,23 @@ export default function RouteScreen() {
     }, 2500);
     return () => clearInterval(timer);
   }, [jobActive, id]);
+
+  // Цена рассказов для кнопки: только владельцу, когда задача не идёт.
+  const missingCount = route?.points.filter((p) => !p.story).length ?? 0;
+  useEffect(() => {
+    if (!route?.canEdit || jobActive || missingCount === 0) {
+      setStoriesCost(null);
+      return;
+    }
+    let off = false;
+    api
+      .storiesQuote(route.id, { style: route.storyStyle })
+      .then((q) => !off && setStoriesCost(q.cost))
+      .catch(() => {});
+    return () => {
+      off = true;
+    };
+  }, [route?.id, route?.canEdit, route?.storyStyle, jobActive, missingCount]);
 
   // Итог задачи — один раз, когда она закончилась у нас на глазах (или только что, до открытия экрана).
   if (job && jobActive && watchedJob !== job.id) setWatchedJob(job.id);
@@ -304,11 +351,12 @@ export default function RouteScreen() {
                 {storyProgress.planning
                   ? 'Готовим рассказы…'
                   : `Создаём рассказы: ${storyProgress.done} из ${storyProgress.total}. Можно закрыть страницу — сервер доделает сам.`}
+                {job?.billing === 'paid' ? ` Списано ${pluralPoints(job.charged ?? 0)}, зарезервировано ${pluralPoints(job.reserved ?? 0)}.` : ''}
               </Text>
             </View>
           ) : missingStories > 0 ? (
             <Button
-              title={`Создать аудиорассказы (${missingStories})`}
+              title={`Создать аудиорассказы (${missingStories})${storiesCost ? ` · ${pluralPoints(storiesCost)}` : ''}`}
               icon="sparkles"
               variant="secondary"
               onPress={() => generateAllStories(route)}
@@ -401,6 +449,8 @@ export default function RouteScreen() {
             onToggle={() => setSelectedId(selectedId === p.id ? null : p.id)}
             onRoute={apply}
             onError={setError}
+            onPaid={priceConfirm.run}
+            canNarrate={ttsEnabled}
           />
         ))}
       </View>
@@ -451,6 +501,7 @@ export default function RouteScreen() {
       <Stack.Screen options={{ title: 'Маршрут' }} />
       <View style={wide ? { flex: 1 } : { height: Math.min(340, width * 0.85) }}>{map}</View>
       <View style={wide ? { width: 480 } : { flex: 1 }}>{details}</View>
+      {priceConfirm.element}
     </View>
   );
 }
@@ -491,6 +542,8 @@ function PointCard({
   onToggle,
   onRoute,
   onError,
+  onPaid,
+  canNarrate,
 }: {
   index: number;
   point: RoutePoint;
@@ -502,6 +555,8 @@ function PointCard({
   onToggle: () => void;
   onRoute: (res: { route: Route; notices?: string[] }) => void;
   onError: (msg: string | null) => void;
+  onPaid: (action: PaidAction) => Promise<void>;
+  canNarrate: boolean;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
@@ -516,6 +571,34 @@ function PointCard({
       onError(message(err));
     } finally {
       setBusy(null);
+    }
+  };
+
+  /** Рассказ или озвучка точки: цена заранее, подтверждение, списание по факту. */
+  const paidStory = async (name: string, title: string, opts: { keepText?: boolean; fresh?: boolean }) => {
+    onError(null);
+    try {
+      let quote = { cost: 0, narrationEstimate: 0 };
+      try {
+        quote = await api.pointStoryQuote(point.id, !!opts.keepText);
+      } catch {
+        // Цену не узнали — если действие платное, сервер ответит новой ценой.
+      }
+      await onPaid({
+        title,
+        cost: quote.cost,
+        note: quote.narrationEstimate > 0 ? NARRATION_NOTE : undefined,
+        perform: async (expectedCost) => {
+          setBusy(name);
+          try {
+            onRoute(await api.generateStory(point.id, { ...opts, style: route.storyStyle, expectedCost }));
+          } finally {
+            setBusy(null);
+          }
+        },
+      });
+    } catch (err) {
+      onError(message(err));
     }
   };
 
@@ -664,9 +747,19 @@ function PointCard({
                 onPress={async () => {
                   if (point.story && !(await confirm('Заменить текущий рассказ новым?', 'Заменить'))) return;
                   // «Создать заново» — всегда новый текст, а не готовый рассказ из другого маршрута.
-                  action('story', () => api.generateStory(point.id, { style: route.storyStyle, fresh: !!point.story }));
+                  paidStory('story', `Рассказ: ${point.name}`, { fresh: !!point.story });
                 }}
               />
+              {canNarrate && point.story && !point.narrationUrl ? (
+                <Button
+                  title="Озвучить"
+                  icon="mic-outline"
+                  variant="secondary"
+                  loading={busy === 'narrate'}
+                  disabled={!!busy || busyStories}
+                  onPress={() => paidStory('narrate', `Озвучка: ${point.name}`, { keepText: true })}
+                />
+              ) : null}
               <Button
                 title={point.story ? 'Править текст' : 'Написать самому'}
                 icon="create-outline"

@@ -169,6 +169,12 @@ export interface Job {
   notices: string[];
   error: string | null;
   params: { request?: { start?: { label?: string } }; autoStories?: boolean };
+  /** free — в бесплатном лимите; paid — за баллы. */
+  billing?: 'free' | 'paid';
+  /** Уже списано баллов по задаче. */
+  charged?: number;
+  /** Ещё зарезервировано: спишется по мере готовности, остаток вернётся. */
+  reserved?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -247,4 +253,17 @@ export interface Quote {
   free?: boolean;
   freeLeft?: number | null;
   limit?: number | null;
+}
+
+export interface StoriesQuote {
+  cost: number;
+  /** Точек, для которых будет что-то сделано. */
+  points: number;
+  items: { pointId: string; story: number; narrationEstimate: number }[];
+}
+
+export interface PointStoryQuote {
+  cost: number;
+  story: number;
+  narrationEstimate: number;
 }
