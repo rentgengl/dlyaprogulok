@@ -13,7 +13,10 @@ const STATUS_TEXT = {
   delisted: 'Снят с продажи администратором. Купившие сохраняют доступ.',
 } as const;
 
-/** Блок автора «Платный доступ»: цена, статус проверки, причина отказа (FR-012, FR-012a). */
+/**
+ * Блок автора «Платный доступ»: цена, статус проверки, причина отказа (FR-012, FR-012a).
+ * Подключается с key = цена: при смене цены форма начинается заново.
+ */
 export function PaidAccessCard({ route, onRoute }: { route: Route; onRoute: (r: Route) => void }) {
   const [pricing, setPricing] = useState<Pricing | null>(null);
   const [enabled, setEnabled] = useState(route.price != null);
@@ -24,10 +27,6 @@ export function PaidAccessCard({ route, onRoute }: { route: Route; onRoute: (r: 
   useEffect(() => {
     api.pricing().then(setPricing).catch(() => {});
   }, []);
-  useEffect(() => {
-    setEnabled(route.price != null);
-    setDraft(route.price != null ? String(route.price) : '');
-  }, [route.price]);
 
   if (!pricing?.paymentsEnabled && route.price == null) return null;
   const range = pricing?.routePrice;

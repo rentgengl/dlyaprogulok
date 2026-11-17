@@ -1,5 +1,11 @@
 import { adminRequest } from './api';
-import type { Quota, Route, RouteSummary, SaleStatus, StoryStyle } from './types';
+import type { LedgerKind, PayoutRequest, Quota, Route, RouteSummary, SaleStatus, StoryStyle } from './types';
+
+/** Заявка на вывод с данными для решения. */
+export type AdminPayout = PayoutRequest & {
+  user: { id: string; email: string; name: string; blocked: boolean; balance: number; income: number };
+  recent: { kind: LedgerKind; amount: number; createdAt: string }[];
+};
 
 export interface AdminStats {
   users: { total: number; verified: number; blocked: number; admins: number; newThisMonth: number };
@@ -85,6 +91,10 @@ export const adminApi = {
   logoutUser: (id: string) => adminRequest<{ closed: number }>(`/api/admin/users/${id}/logout`, { method: 'POST' }),
   deleteUser: (id: string) => adminRequest<void>(`/api/admin/users/${id}`, { method: 'DELETE' }),
 
+  payouts: (status: 'open' | 'paid' | 'rejected' | 'all' = 'open') =>
+    adminRequest<{ payouts: AdminPayout[] }>(`/api/admin/payouts?status=${status}`),
+  payoutDecision: (id: string, decision: 'paid' | 'rejected', note: string) =>
+    adminRequest<{ payout: PayoutRequest }>(`/api/admin/payouts/${id}/decision`, body('POST', { decision, note })),
   /** Очередь проверки платных маршрутов: с полным содержимым. */
   paidRoutes: (status: SaleStatus = 'pending') => adminRequest<{ routes: Route[] }>(`/api/admin/paid-routes?status=${status}`),
   saleDecision: (id: string, decision: 'approve' | 'reject' | 'delist', note?: string) =>

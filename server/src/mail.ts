@@ -108,3 +108,27 @@ ${note ? `<p>Комментарий администратора: ${escapeHtml(n
 <p><a href="${escapeHtml(link)}">${escapeHtml(routeTitle)}</a></p>`;
   return { to, subject, text, html };
 }
+
+/** Решение по заявке на вывод (FR-024b). */
+export function payoutDecisionMail(
+  to: string,
+  name: string,
+  decision: 'paid' | 'rejected',
+  points: number,
+  payoutRub: number,
+  note: string,
+  link: string,
+): Mail {
+  const rub = payoutRub.toLocaleString('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  const body =
+    decision === 'paid'
+      ? `Заявка на вывод ${points} баллов выполнена: к выплате ${rub} ₽ по договору.`
+      : `Заявка на вывод ${points} баллов отклонена. Баллы вернулись на счёт.`;
+  const label = decision === 'paid' ? 'Комментарий о переводе' : 'Причина';
+  const text = [`${name}, здравствуйте!`, '', body, '', `${label}: ${note}`, '', link].join('\n');
+  const html = `<p>${escapeHtml(name)}, здравствуйте!</p>
+<p>${escapeHtml(body)}</p>
+<p>${label}: ${escapeHtml(note)}</p>
+<p><a href="${escapeHtml(link)}">Баллы в «Для прогулок»</a></p>`;
+  return { to, subject: decision === 'paid' ? 'Вывод баллов выполнен' : 'Заявка на вывод отклонена', text, html };
+}

@@ -627,3 +627,223 @@ describe('ЮKassa и зависшие резервы', () => {
     );
   });
 });
+
+describe('монетизация: премии (US3) и вывод (US4)', () => {
+  let dir: string;
+  let app: FastifyInstance;
+  let db: DatabaseSync;
+  let mails: Mail[];
+  let n = 0;
+  const env = { PAYMENTS_PROVIDER: 'fake' };
+
+  before(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'rasskazhi-tips-'));
+  });
+  after(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(async () => app?.close());
+  beforeEach(async () => {
+    mails = [];
+    const sub = mkdtempSync(path.join(dir, 't-'));
+    db = openDb(path.join(sub, 'db.sqlite'));
+    const mailer = { name: 'тест', send: async (m: Mail) => void mails.push(m) };
+    app = await buildApp({
+      db,
+      geo,
+      ai: null,
+      tts: null,
+      uploadsDir: path.join(sub, 'uploads'),
+      mailer,
+      adminEmails: ['boss@example.com'],
+      baseEnv: env,
+      reconfigure: (e) => ({ ...servicesFromEnv(e), mailer }),
+      pricing: pricingFromEnv(env),
+      payments: paymentsFromEnv(env),
+    });
+  });
+
+  const call = async (method: string, url: string, token?: string, body?: unknown) => {
+    const res = await app.inject({
+      method: method as 'GET',
+      url,
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      ...(body !== undefined ? { payload: body as object } : {}),
+    });
+    return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null };
+  };
+
+  const register = async (email = `t${++n}@example.com`) => {
+    const res = await call('POST', '/api/auth/register', undefined, { email, password: 'correct horse', name: `Имя ${n}` });
+    assert.equal(res.status, 201, JSON.stringify(res.json));
+    db.prepare('UPDATE users SET email_verified_at = ? WHERE id = ?').run(new Date().toISOString(), res.json.user.id);
+    return { token: res.json.token as string, id: res.json.user.id as string, name: res.json.user.name as string, email };
+  };
+
+  const buy = async (token: string, points: number) => {
+    const created = await call('POST', '/api/payments', token, { points });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    await call('POST', `/api/dev/fake-payments/${created.json.payment.id}`, token, { result: 'succeeded' });
+  };
+
+  /** Маршрут напрямую в базе: подбор мест для этих проверок не нужен. */
+  const route = (ownerId: string, opts: { isPublic?: boolean; price?: number; sale?: string } = {}) => {
+    const id = randomUUID();
+    db.prepare(
+      `INSERT INTO routes (id, owner_id, title, description, lang, is_public, round_trip, start_lat, start_lng, distance_m,
+         duration_min, geometry, planner, created_at, updated_at, price, sale_status)
+       VALUES (?, ?, ?, '', 'ru', ?, 0, 55.75, 37.62, 1000, 30, '[]', 'manual', ?, ?, ?, ?)`,
+    ).run(id, ownerId, `Маршрут ${id.slice(0, 4)}`, opts.isPublic === false ? 0 : 1, new Date().toISOString(), new Date().toISOString(), opts.price ?? null, opts.sale ?? null);
+    return id;
+  };
+
+  const wallet = async (token: string) => (await call('GET', '/api/wallet', token)).json;
+  const history = async (token: string) => (await call('GET', '/api/wallet/history', token)).json.items;
+
+  test('премия 50 по маршруту: −50 у отправителя, +40 автору, +10 сервису; автор видит имя, маршрут и сообщение', async () => {
+    const author = await register();
+    const fan = await register();
+    const id = route(author.id);
+    await buy(fan.token, 100);
+    assert.equal((await call('POST', '/api/tips', fan.token, { authorId: author.id, routeId: id, amount: 50, expectedCost: 40 })).json.code, 'PRICE_CHANGED');
+    const res = await call('POST', '/api/tips', fan.token, {
+      authorId: author.id,
+      routeId: id,
+      amount: 50,
+      message: '  <b>Спасибо</b> за прогулку!  ',
+      expectedCost: 50,
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.json));
+    assert.equal((await wallet(fan.token)).balance, 50);
+    assert.equal((await wallet(author.token)).balance, 40);
+    assert.equal((await wallet(author.token)).incomeThisMonth, 40);
+    const revenue = db
+      .prepare("SELECT SUM(e.amount) AS s FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id WHERE t.kind = 'tip' AND e.account = 'sys:revenue'")
+      .get() as any;
+    assert.equal(revenue.s, 10);
+
+    const got = (await history(author.token))[0];
+    assert.equal(got.kind, 'tip');
+    assert.equal(got.amount, 40);
+    assert.equal(got.commission, 10);
+    assert.equal(got.message, 'Спасибо за прогулку!', 'без разметки и лишних пробелов');
+    assert.deepEqual(got.counterparty, { id: fan.id, name: fan.name });
+    assert.equal(got.route.id, id);
+    const sent = (await history(fan.token))[0];
+    assert.equal(sent.amount, -50);
+    assert.equal(sent.message, null, 'сообщение видно только автору');
+    assert.deepEqual(sent.counterparty, { id: author.id, name: author.name });
+
+    // Без маршрута — со страницы автора.
+    assert.equal((await call('POST', '/api/tips', fan.token, { authorId: author.id, amount: 10, expectedCost: 10 })).status, 201);
+    assert.equal((await history(author.token))[0].route, null);
+    assert.deepEqual(reconcile(db), []);
+  });
+
+  test('премия: границы суммы и сообщения, себе нельзя, чужой приватный и закрытый маршрут — 404', async () => {
+    const author = await register();
+    const fan = await register();
+    await buy(fan.token, 6000);
+    const tip = (body: Record<string, unknown>) =>
+      call('POST', '/api/tips', fan.token, { authorId: author.id, amount: 30, expectedCost: (body.amount as number) ?? 30, ...body });
+    assert.equal((await tip({ message: 'я'.repeat(201) })).status, 400);
+    assert.equal((await tip({ amount: 5 })).status, 400);
+    assert.equal((await tip({ amount: 5001 })).status, 400);
+    assert.equal((await call('POST', '/api/tips', fan.token, { authorId: fan.id, amount: 30, expectedCost: 30 })).status, 400, 'себе');
+    assert.equal((await tip({ routeId: route(author.id, { isPublic: false }) })).status, 404, 'приватный');
+    assert.equal((await tip({ routeId: route(author.id, { price: 100, sale: 'approved' }) })).status, 404, 'закрытый не открыт');
+    assert.equal((await tip({ routeId: route(fan.id) })).status, 404, 'маршрут другого автора');
+    assert.equal((await call('POST', '/api/tips', fan.token, { authorId: randomUUID(), amount: 30, expectedCost: 30 })).status, 404);
+    assert.equal((await wallet(fan.token)).balance, 6000, 'ничего не списано');
+  });
+
+  test('страница автора: имя и маршруты из каталога; обезличенный — без маршрутов', async () => {
+    const author = await register();
+    const open = route(author.id);
+    route(author.id, { isPublic: false });
+    route(author.id, { price: 100, sale: 'pending' });
+    const res = await call('GET', `/api/authors/${author.id}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.json.author.name, author.name);
+    assert.deepEqual(res.json.routes.map((r: any) => r.id), [open]);
+    assert.equal((await call('GET', `/api/authors/${randomUUID()}`)).status, 404);
+    db.prepare("UPDATE users SET deleted_at = ?, name = 'Удалённый автор' WHERE id = ?").run(new Date().toISOString(), author.id);
+    const gone = await call('GET', `/api/authors/${author.id}`);
+    assert.deepEqual(gone.json, { author: { id: author.id, name: 'Удалённый автор' }, routes: [] });
+  });
+
+  test('вывод: расчёт, заморозка, одна заявка, «выплачено» с письмом, комиссия зафиксирована', async () => {
+    const user = await register();
+    const admin = await register('boss@example.com');
+    const other = await register();
+    await buy(user.token, 1200);
+
+    const quote = await call('GET', '/api/payouts/quote?points=1000', user.token);
+    assert.deepEqual(quote.json, { points: 1000, feePct: 5, fee: 50, payoutRub: 950 });
+    assert.equal((await call('POST', '/api/payouts', user.token, { points: 499 })).status, 400, 'меньше минимума');
+    assert.equal((await call('POST', '/api/payouts', user.token, { points: 1300 })).json.code, 'INSUFFICIENT_POINTS');
+    const created = await call('POST', '/api/payouts', user.token, { points: 1000 });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    assert.equal(created.json.payout.payoutRub, 950);
+    assert.equal(created.json.payout.status, 'open');
+    assert.equal((await call('POST', '/api/payouts', user.token, { points: 500 })).status, 409, 'вторая открытая');
+    const w = await wallet(user.token);
+    assert.deepEqual([w.balance, w.available, w.frozen], [1200, 200, 1000]);
+    assert.equal(w.pendingPayout.id, created.json.payout.id);
+    const spend = await call('POST', '/api/tips', user.token, { authorId: other.id, amount: 300, expectedCost: 300 });
+    assert.equal(spend.status, 402, 'замороженные баллы не тратятся');
+
+    // Смена комиссии не меняет поданную заявку.
+    assert.equal((await call('PUT', '/api/admin/settings', admin.token, { values: { PAYOUT_COMMISSION_PCT: '10' } })).status, 200);
+    assert.equal((await call('GET', '/api/payouts/quote?points=1000', user.token)).json.payoutRub, 900);
+
+    assert.equal((await call('GET', '/api/admin/payouts', user.token)).status, 403);
+    assert.equal((await call('POST', `/api/admin/payouts/${created.json.payout.id}/decision`, user.token, { decision: 'paid', note: 'x' })).status, 403);
+    const list = await call('GET', '/api/admin/payouts?status=open', admin.token);
+    assert.equal(list.status, 200);
+    assert.equal(list.json.payouts.length, 1);
+    assert.equal(list.json.payouts[0].payoutRub, 950);
+    assert.equal(list.json.payouts[0].feePct, 5);
+    assert.equal(list.json.payouts[0].user.email, user.email);
+
+    const id = created.json.payout.id;
+    assert.equal((await call('POST', `/api/admin/payouts/${id}/decision`, admin.token, { decision: 'paid' })).status, 400, 'нужен комментарий');
+    mails.length = 0;
+    const paid = await call('POST', `/api/admin/payouts/${id}/decision`, admin.token, { decision: 'paid', note: 'Перевод 950 ₽ по договору' });
+    assert.equal(paid.status, 200, JSON.stringify(paid.json));
+    const after = await wallet(user.token);
+    assert.deepEqual([after.balance, after.available, after.frozen, after.pendingPayout], [200, 200, 0, null]);
+    assert.equal((await history(user.token))[0].kind, 'payout');
+    assert.equal(mails.length, 1);
+    assert.equal(mails[0]!.to, user.email);
+    assert.match(mails[0]!.text, /950/);
+    assert.equal((await call('POST', `/api/admin/payouts/${id}/decision`, admin.token, { decision: 'rejected', note: 'x' })).status, 409);
+    assert.deepEqual(reconcile(db), []);
+  });
+
+  test('вывод: отклонение и отзыв снимают заморозку; чужую заявку не отозвать', async () => {
+    const user = await register();
+    const admin = await register('boss@example.com');
+    const other = await register();
+    await buy(user.token, 1000);
+    const first = (await call('POST', '/api/payouts', user.token, { points: 600 })).json.payout;
+    const rejected = await call('POST', `/api/admin/payouts/${first.id}/decision`, admin.token, { decision: 'rejected', note: 'Нет договора' });
+    assert.equal(rejected.status, 200);
+    assert.deepEqual([(await wallet(user.token)).available, (await wallet(user.token)).frozen], [1000, 0]);
+    const mine = (await call('GET', '/api/payouts', user.token)).json.payouts;
+    assert.equal(mine[0].status, 'rejected');
+    assert.equal(mine[0].note, 'Нет договора');
+
+    const second = (await call('POST', '/api/payouts', user.token, { points: 700 })).json.payout;
+    assert.equal((await call('DELETE', `/api/payouts/${second.id}`, other.token)).status, 404);
+    const revoked = await call('DELETE', `/api/payouts/${second.id}`, user.token);
+    assert.equal(revoked.status, 200);
+    assert.equal(revoked.json.payout.status, 'rejected');
+    assert.equal((await wallet(user.token)).available, 1000);
+    assert.equal((await call('DELETE', `/api/payouts/${second.id}`, user.token)).status, 409, 'уже закрыта');
+
+    // Заблокированный пользователь не подаст заявку: сессии закрыты, счёт заморожен.
+    await call('PATCH', `/api/admin/users/${user.id}`, admin.token, { blocked: true });
+    const blocked = await call('POST', '/api/payouts', user.token, { points: 600 });
+    assert.ok(blocked.status === 401 || blocked.json?.code === 'WALLET_FROZEN');
+    assert.deepEqual(reconcile(db), []);
+  });
+});

@@ -12,6 +12,7 @@ const SECTIONS: { href: string; label: string; icon: IconName }[] = [
   { href: '/admin', label: 'Обзор', icon: 'speedometer-outline' },
   { href: '/admin/routes', label: 'Маршруты', icon: 'map-outline' },
   { href: '/admin/paid-routes', label: 'Проверка', icon: 'pricetag-outline' },
+  { href: '/admin/payouts', label: 'Вывод', icon: 'cash-outline' },
   { href: '/admin/users', label: 'Пользователи', icon: 'people-outline' },
   { href: '/admin/settings', label: 'Настройки', icon: 'options-outline' },
 ];

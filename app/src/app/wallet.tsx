@@ -6,6 +6,7 @@ import { Banner, Button, Chip, Field, layout, SignInPrompt } from '@/components/
 import { VerifyEmailCard } from '@/components/VerifyEmail';
 import { api, ApiError } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
+import { confirm } from '@/lib/confirm';
 import { formatMoscowDate } from '@/lib/format';
 import { colors, space } from '@/lib/theme';
 import type { LedgerItem, Payment, Pricing, Wallet } from '@/lib/types';
@@ -264,6 +265,8 @@ export default function WalletScreen() {
 
       {error ? <Banner text={error} /> : null}
 
+      {wallet && pricing ? <PayoutCard wallet={wallet} pricing={pricing} onChange={load} /> : null}
+
       <View style={{ gap: space.sm }}>
         <Text style={layout.h2}>История</Text>
         {items.length === 0 && wallet ? <Text style={layout.muted}>Операций пока нет.</Text> : null}
@@ -273,6 +276,103 @@ export default function WalletScreen() {
         {next ? <Button title="Показать ещё" variant="secondary" onPress={more} loading={loadingMore} /> : null}
       </View>
     </ScrollView>
+  );
+}
+
+/** Доход за месяц и вывод баллов по заявке (FR-024, FR-024d). */
+function PayoutCard({ wallet, pricing, onChange }: { wallet: Wallet; pricing: Pricing; onChange: () => void }) {
+  const [points, setPoints] = useState('');
+  const [quote, setQuote] = useState<{ points: number; fee: number; payoutRub: number; feePct: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const value = Number(points);
+  const valid = Number.isInteger(value) && value >= pricing.payoutMin && value <= wallet.available;
+  const open = wallet.pendingPayout;
+
+  useEffect(() => {
+    if (!valid) return;
+    let off = false;
+    const t = setTimeout(() => {
+      api.payoutQuote(value).then(
+        (q) => !off && setQuote(q),
+        () => {},
+      );
+    }, 300);
+    return () => {
+      off = true;
+      clearTimeout(t);
+    };
+  }, [value, valid]);
+
+  const act = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+      setPoints('');
+      onChange();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Не удалось');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rub = (n: number) => n.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+  const shown = valid && quote?.points === value ? quote : null;
+
+  return (
+    <View style={layout.card}>
+      <Text style={layout.h2}>Доход и вывод</Text>
+      <Text style={layout.body}>Доход за месяц: {pluralPoints(wallet.incomeThisMonth)}</Text>
+      {open ? (
+        <>
+          <Banner
+            tone="info"
+            text={`Заявка на вывод ${pluralPoints(open.points)} от ${formatMoscowDate(open.createdAt)}: к выплате ${rub(open.payoutRub)} ₽. Баллы заморожены до решения.`}
+          />
+          <Button
+            title="Отозвать заявку"
+            variant="secondary"
+            loading={busy}
+            onPress={async () => {
+              if (await confirm('Отозвать заявку на вывод? Баллы снова можно будет тратить.', 'Отозвать')) {
+                act(() => api.revokePayout(open.id));
+              }
+            }}
+          />
+        </>
+      ) : (
+        <>
+          <Text style={layout.muted}>
+            Вывести можно любые баллы на счёте, от {pluralPoints(pricing.payoutMin)}. Комиссия за вывод — {pricing.payoutCommissionPct} %.
+            Деньги переводит администратор по договору с вами.
+          </Text>
+          <Field
+            label="Сколько вывести"
+            placeholder={`От ${pricing.payoutMin} до ${wallet.available}`}
+            value={points}
+            onChangeText={(t) => setPoints(t.replace(/\D/g, ''))}
+            keyboardType="number-pad"
+            maxLength={7}
+          />
+          {points && !valid ? (
+            <Text style={styles.warn}>
+              {wallet.available < pricing.payoutMin
+                ? `Для вывода нужно хотя бы ${pluralPoints(pricing.payoutMin)}`
+                : `От ${pricing.payoutMin} до ${wallet.available} баллов`}
+            </Text>
+          ) : null}
+          {shown ? (
+            <Text style={layout.body}>
+              Спишется {pluralPoints(shown.points)}, к выплате {rub(shown.payoutRub)} ₽, комиссия {rub(shown.fee)} ₽.
+            </Text>
+          ) : null}
+          <Button title="Подать заявку" variant="secondary" loading={busy} disabled={!shown} onPress={() => act(() => api.createPayout(value))} />
+        </>
+      )}
+      {error ? <Banner text={error} /> : null}
+    </View>
   );
 }
 

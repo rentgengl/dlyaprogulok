@@ -338,7 +338,23 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     mailer: () => mailer,
     appUrl: () => appUrl,
     log: app.log,
-    routes: { load: loadRouteRow, owned: ownedRoute, full: fullRoute },
+    // Обёртки: canView и withOwned объявлены ниже и нужны только во время запросов.
+    routes: {
+      load: loadRouteRow,
+      owned: ownedRoute,
+      full: fullRoute,
+      canView: (row, viewer) => canView(row, viewer),
+      listedBy: (ownerId, viewer) =>
+        withOwned(
+          db
+            .prepare(
+              `SELECT ${ROUTE_COLUMNS} FROM routes r JOIN users u ON u.id = r.owner_id
+               WHERE r.owner_id = ? AND ${LISTED} ORDER BY r.created_at DESC LIMIT 200`,
+            )
+            .all(ownerId) as any[],
+          viewer,
+        ),
+    },
   };
   /** Платные действия включены, только когда подключён платёжный шлюз; иначе всё как до монетизации. */
   const charging = () => !!payments.provider;

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Image, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { AddPlace, type AddMode } from '@/components/AddPlace';
 import { PaidAccessCard } from '@/components/PaidAccess';
+import { TipButton } from '@/components/TipSheet';
 import { pluralPoints, usePriceConfirm, type PaidAction } from '@/components/PriceConfirm';
 import { endpointsText, EndpointsCard, type Draft, type EndpointTarget } from '@/components/Endpoints';
 import { ExportCard } from '@/components/ExportCard';
@@ -66,6 +67,7 @@ export default function RouteScreen() {
   /** Цена рассказов для точек без них; null — неизвестна или не нужна. */
   const [storiesCost, setStoriesCost] = useState<number | null>(null);
   const priceConfirm = usePriceConfirm();
+  const runPaid = priceConfirm.run;
   /** Сервер умеет озвучивать текст: без этого кнопки «Озвучить» нет (звучит голос устройства). */
   const [ttsEnabled, setTtsEnabled] = useState(false);
   useEffect(() => {
@@ -119,7 +121,7 @@ export default function RouteScreen() {
         } catch {
           // Цену не узнали — если действие платное, сервер ответит новой ценой.
         }
-        await priceConfirm.run({
+        await runPaid({
           title: quote.points ? `Рассказы для мест: ${quote.points}` : 'Рассказы для мест',
           cost: quote.cost,
           note: `${NARRATION_NOTE} Если рассказ для какого-то места не получится, баллы за него не спишутся.`,
@@ -132,7 +134,7 @@ export default function RouteScreen() {
         setError(message(err));
       }
     },
-    [priceConfirm.run],
+    [runPaid],
   );
 
   // Пока задача идёт, маршрут перечитывается: рассказы появляются по мере готовности.
@@ -151,11 +153,9 @@ export default function RouteScreen() {
 
   // Цена рассказов для кнопки: только владельцу, когда задача не идёт.
   const missingCount = route?.points.filter((p) => !p.story).length ?? 0;
+  const wantStoriesCost = !!route?.canEdit && !jobActive && missingCount > 0;
   useEffect(() => {
-    if (!route?.canEdit || jobActive || missingCount === 0) {
-      setStoriesCost(null);
-      return;
-    }
+    if (!wantStoriesCost || !route) return;
     let off = false;
     api
       .storiesQuote(route.id, { style: route.storyStyle })
@@ -164,7 +164,8 @@ export default function RouteScreen() {
     return () => {
       off = true;
     };
-  }, [route?.id, route?.canEdit, route?.storyStyle, jobActive, missingCount]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route?.id, route?.storyStyle, wantStoriesCost, missingCount]);
 
   // Итог задачи — один раз, когда она закончилась у нас на глазах (или только что, до открытия экрана).
   if (job && jobActive && watchedJob !== job.id) setWatchedJob(job.id);
@@ -317,7 +318,7 @@ export default function RouteScreen() {
       {route.description ? <Text style={layout.body}>{route.description}</Text> : null}
       <Text style={layout.muted}>
         {formatDistance(route.distanceM)} · {formatDuration(route.durationMin)} · {pluralStops(route.points.length)}
-        {route.roundTrip ? ' · кольцевой' : ''} · {route.ownerName}
+        {route.roundTrip ? ' · кольцевой' : ''} · <AuthorLink id={route.ownerId} name={route.ownerName} />
       </Text>
       <Text style={layout.muted}>{endpointsText(route)}</Text>
 
@@ -386,7 +387,7 @@ export default function RouteScreen() {
             </View>
           ) : missingStories > 0 ? (
             <Button
-              title={`Создать аудиорассказы (${missingStories})${storiesCost ? ` · ${pluralPoints(storiesCost)}` : ''}`}
+              title={`Создать аудиорассказы (${missingStories})${wantStoriesCost && storiesCost ? ` · ${pluralPoints(storiesCost)}` : ''}`}
               icon="sparkles"
               variant="secondary"
               onPress={() => generateAllStories(route)}
@@ -421,6 +422,9 @@ export default function RouteScreen() {
       ) : (
         <RatingBlock route={route} signedIn={!!user} onRate={(v) => run(() => api.rate(route.id, v))} />
       )}
+      {user && !route.isOwner && !route.deletedByAuthor && route.ownerName !== DELETED_AUTHOR ? (
+        <TipButton authorId={route.ownerId} authorName={route.ownerName} routeId={route.id} onSent={setInfo} />
+      ) : null}
 
       {route.canEdit ? (
         <EndpointsCard
@@ -503,7 +507,7 @@ export default function RouteScreen() {
 
       <ExportCard route={route} />
 
-      {route.canEdit ? <PaidAccessCard route={route} onRoute={setRoute} /> : null}
+      {route.canEdit ? <PaidAccessCard key={String(route.price)} route={route} onRoute={setRoute} /> : null}
 
       {route.canEdit ? (
         <Button
@@ -538,6 +542,18 @@ export default function RouteScreen() {
   );
 }
 
+const DELETED_AUTHOR = 'Удалённый автор';
+
+/** Имя автора — ссылка на его страницу (кроме удалённого аккаунта). */
+function AuthorLink({ id, name }: { id: string; name: string }) {
+  if (name === DELETED_AUTHOR) return <>{name}</>;
+  return (
+    <Text style={styles.link} role="link" onPress={() => router.push({ pathname: '/author/[id]', params: { id } })}>
+      {name}
+    </Text>
+  );
+}
+
 /** Превью закрытого платного маршрута: обложка, факты, цена и покупка (FR-013, FR-014a). */
 function LockedRoute({
   route,
@@ -560,7 +576,7 @@ function LockedRoute({
       {route.description ? <Text style={layout.body}>{route.description}</Text> : null}
       <Text style={layout.muted}>
         {formatDistance(route.distanceM)} · {formatDuration(route.durationMin)} · {pluralStops(route.pointCount)}
-        {route.city ? ` · ${route.city}` : ''} · {route.ownerName}
+        {route.city ? ` · ${route.city}` : ''} · <AuthorLink id={route.ownerId} name={route.ownerName} />
       </Text>
       {route.start.label ? <Text style={layout.muted}>Старт: {route.start.label}</Text> : null}
       {route.rating.count > 0 ? (

@@ -9,10 +9,10 @@ import { z } from 'zod';
 import type { User } from './app.ts';
 import { tx } from './db.ts';
 import { HttpError } from './errors.ts';
-import { available, balanceOf, heldOf, post, release, spend, userAccount } from './ledger.ts';
+import { available, balanceOf, heldOf, hold, post, release, spend, userAccount } from './ledger.ts';
 import type { Mailer } from './mail.ts';
 import { createGateway, isYookassaIp, type FakeGateway, type PaymentGateway, type ProviderPayment } from './payments.ts';
-import { splitShare, type Pricing } from './pricing.ts';
+import { payoutQuote, splitShare, type Pricing } from './pricing.ts';
 import type { PaymentsConfig } from './settings.ts';
 
 export interface MoneyContext {
@@ -30,6 +30,10 @@ export interface MoneyContext {
     load: (id: string) => any;
     owned: (id: string, user: User) => any;
     full: (row: any, viewer: User | null) => unknown;
+    /** Полный доступ к содержимому (бесплатный открытый, свой, купленный). */
+    canView: (row: any, viewer: User | null) => boolean;
+    /** Маршруты автора из каталога. */
+    listedBy: (ownerId: string, viewer: User | null) => unknown[];
   };
 }
 
@@ -346,6 +350,153 @@ export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
     return reply.status(201).send({ route: ctx.routes.full(ctx.routes.load(id), user) });
   });
 
+  // ---------- Премии ----------
+
+  /** Сообщение премии: без разметки и лишних пробелов (FR-022). */
+  const cleanMessage = (raw: string | undefined) => {
+    const text = (raw ?? '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    return text || null;
+  };
+
+  /** Премия автору или по маршруту (FR-018–FR-021): сумма минус комиссия — автору. */
+  app.post('/api/tips', { config: { rateLimit: { max: 30, timeWindow: '1 hour' } } }, async (req, reply) => {
+    const user = requireSpender(ctx, req);
+    const p = ctx.pricing();
+    const body = z
+      .object({
+        authorId: z.string().uuid(),
+        routeId: z.string().uuid().optional(),
+        amount: z
+          .number()
+          .int('Сумма — целое число баллов')
+          .min(p.tipMin, `Премия — от ${p.tipMin} баллов`)
+          .max(p.tipMax, `Премия — не больше ${p.tipMax} баллов`),
+        message: z.string().max(2000).optional(),
+        expectedCost: z.number().int().min(0).optional(),
+      })
+      .parse(req.body);
+    const message = cleanMessage(body.message);
+    if (message && message.length > 200) throw new HttpError(400, 'Сообщение — не длиннее 200 символов');
+    if (body.authorId === user.id) throw new HttpError(400, 'Отправить премию самому себе нельзя');
+    const author = db.prepare('SELECT id, name FROM users WHERE id = ? AND deleted_at IS NULL').get(body.authorId) as
+      | { id: string; name: string }
+      | undefined;
+    if (!author) throw new HttpError(404, 'Автор не найден');
+    let route: any = null;
+    if (body.routeId) {
+      route = ctx.routes.load(body.routeId);
+      // Чужой приватный или неоткрытый платный маршрут — как несуществующий.
+      if (!route || route.owner_id !== author.id || !ctx.routes.canView(route, user)) throw new HttpError(404, 'Маршрут не найден');
+    }
+    checkExpected(body.amount, body.expectedCost);
+    const share = splitShare(body.amount, p.saleCommissionPct);
+    const id = randomUUID();
+    const ts = nowIso();
+    tx(db, () => {
+      const txId = spend(db, user.id, body.amount, {
+        kind: 'tip',
+        actorId: user.id,
+        refType: 'tip',
+        refId: id,
+        meta: {
+          ...(route ? { routeId: route.id, routeTitle: route.title } : {}),
+          counterpartyId: user.id,
+          counterpartyName: user.name,
+          authorId: author.id,
+          authorName: author.name,
+          commission: share.commission,
+          ...(message ? { message } : {}),
+        },
+        entries: [
+          { account: userAccount(user.id), amount: -body.amount },
+          { account: userAccount(author.id), amount: share.author },
+          { account: 'sys:revenue', amount: share.commission },
+        ],
+      });
+      db.prepare(
+        `INSERT INTO tips (id, sender_id, author_id, route_id, amount, author_share, message, ledger_tx_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, user.id, author.id, route?.id ?? null, body.amount, share.author, message, txId, ts);
+    });
+    return reply.status(201).send({
+      tip: { id, authorId: author.id, routeId: route?.id ?? null, amount: body.amount, authorShare: share.author, message, createdAt: ts },
+    });
+  });
+
+  /** Страница автора: имя и маршруты из каталога; обезличенный аккаунт — без маршрутов. */
+  app.get('/api/authors/:id', async (req) => {
+    const { id } = routeParams.parse(req.params);
+    const row = db.prepare('SELECT id, name, deleted_at FROM users WHERE id = ?').get(id) as any;
+    if (!row) throw new HttpError(404, 'Автор не найден');
+    if (row.deleted_at) return { author: { id, name: 'Удалённый автор' }, routes: [] };
+    return { author: { id, name: row.name }, routes: ctx.routes.listedBy(id, req.user ?? null) };
+  });
+
+  // ---------- Вывод ----------
+
+  const serializePayout = (r: any) => ({
+    id: r.id,
+    points: r.points,
+    feePct: r.fee_pct,
+    payoutRub: r.payout_kop / 100,
+    status: r.status,
+    createdAt: r.created_at,
+    note: r.admin_note ?? null,
+    decidedAt: r.decided_at ?? null,
+  });
+
+  app.get('/api/payouts/quote', async (req) => {
+    ctx.requireUser(req);
+    const { points } = z.object({ points: z.coerce.number().int().min(1).max(10_000_000) }).parse(req.query);
+    const q = payoutQuote(points, ctx.pricing().payoutCommissionPct);
+    return { points, feePct: q.feePct, fee: q.feeKop / 100, payoutRub: q.payoutKop / 100 };
+  });
+
+  /** Заявка на вывод (FR-024, FR-024d): баллы замораживаются, комиссия фиксируется при подаче. */
+  app.post('/api/payouts', { config: { rateLimit: { max: 5, timeWindow: '1 day' } } }, async (req, reply) => {
+    const user = requireSpender(ctx, req);
+    const p = ctx.pricing();
+    const { points } = z
+      .object({ points: z.number().int('Целое число баллов').min(p.payoutMin, `Вывести можно от ${p.payoutMin} баллов`) })
+      .parse(req.body);
+    const q = payoutQuote(points, p.payoutCommissionPct);
+    const id = randomUUID();
+    tx(db, () => {
+      if (db.prepare("SELECT 1 FROM payout_requests WHERE user_id = ? AND status = 'open'").get(user.id)) {
+        throw new HttpError(409, 'Уже есть открытая заявка на вывод. Дождитесь решения или отзовите её.');
+      }
+      const h = hold(db, { userId: user.id, kind: 'payout', amount: points, refType: 'payout', refId: id });
+      db.prepare(
+        `INSERT INTO payout_requests (id, user_id, points, fee_pct, payout_kop, status, hold_id, created_at)
+         VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`,
+      ).run(id, user.id, points, q.feePct, q.payoutKop, h.id, nowIso());
+    });
+    req.log.info({ user: user.id, payout: id, points }, 'заявка на вывод');
+    return reply.status(201).send({ payout: serializePayout(db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id)) });
+  });
+
+  app.get('/api/payouts', async (req) => {
+    const user = ctx.requireUser(req);
+    const rows = db.prepare('SELECT * FROM payout_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').all(user.id);
+    return { payouts: rows.map(serializePayout) };
+  });
+
+  /** Отзыв своей открытой заявки: заморозка снимается. */
+  app.delete('/api/payouts/:id', async (req) => {
+    const user = ctx.requireUser(req);
+    const { id } = routeParams.parse(req.params);
+    const row = db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id) as any;
+    if (!row || row.user_id !== user.id) throw new HttpError(404, 'Заявка не найдена');
+    if (row.status !== 'open') throw new HttpError(409, 'Заявка уже закрыта');
+    tx(db, () => {
+      release(db, row.hold_id);
+      db.prepare(
+        "UPDATE payout_requests SET status = 'rejected', admin_note = 'Отозвана пользователем', decided_at = ?, decided_by = ? WHERE id = ?",
+      ).run(nowIso(), user.id, id);
+    });
+    return { payout: serializePayout(db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id)) };
+  });
+
   // ---------- Фоновая сверка ----------
 
   /**
@@ -451,7 +602,13 @@ export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
         createdAt: r.created_at,
         title: meta.title ?? titles[r.amount < 0 ? 0 : 1],
         route: meta.routeId ? { id: meta.routeId, title: meta.routeTitle ?? '' } : null,
-        counterparty: meta.counterpartyId ? { id: meta.counterpartyId, name: meta.counterpartyName ?? '' } : null,
+        // Отправителю премии контрагент — автор, автору — отправитель.
+        counterparty:
+          r.amount < 0 && meta.authorId
+            ? { id: meta.authorId, name: meta.authorName ?? '' }
+            : meta.counterpartyId
+              ? { id: meta.counterpartyId, name: meta.counterpartyName ?? '' }
+              : null,
         // Комиссия видна только получателю дохода.
         commission: r.amount > 0 && typeof meta.commission === 'number' ? meta.commission : null,
         message: r.amount > 0 && meta.message ? meta.message : null,

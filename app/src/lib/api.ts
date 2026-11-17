@@ -11,6 +11,7 @@ import type {
   LatLng,
   LedgerItem,
   Payment,
+  PayoutRequest,
   Pricing,
   Quote,
   StoriesQuote,
@@ -102,7 +103,8 @@ export const api = {
   forgotPassword: (email: string) => request<{ sent: true }>('/api/auth/forgot', json('POST', { email })),
   resetPassword: (token: string, password: string) =>
     request<{ token: string; user: User }>('/api/auth/reset', json('POST', { token, password })),
-  deleteAccount: (password: string) => request<void>('/api/me', json('DELETE', { password })),
+  /** force — удалить, даже если на счёте остались баллы (иначе 409 HAS_POINTS). */
+  deleteAccount: (password: string, force = false) => request<void>('/api/me', json('DELETE', { password, force })),
   me: () => request<{ user: User }>('/api/me'),
   /** Что включено на сервере: ИИ, синтез речи, подтверждение почты. */
   config: () => request<{ aiEnabled: boolean; ttsEnabled: boolean; emailVerification: boolean }>('/api/config'),
@@ -227,6 +229,16 @@ export const api = {
   setRoutePrice: (id: string, price: number | null) => request<RouteResponse>(`/api/routes/${id}/price`, json('PUT', { price })),
   purchaseRoute: (id: string, expectedCost: number) =>
     request<RouteResponse>(`/api/routes/${id}/purchase`, json('POST', { expectedCost })),
+
+  // ---------- Премии и вывод ----------
+  sendTip: (body: { authorId: string; routeId?: string; amount: number; message?: string; expectedCost: number }) =>
+    request<{ tip: { id: string; amount: number } }>('/api/tips', json('POST', body)),
+  author: (id: string) => request<{ author: { id: string; name: string }; routes: RouteSummary[] }>(`/api/authors/${id}`),
+  payoutQuote: (points: number) =>
+    request<{ points: number; feePct: number; fee: number; payoutRub: number }>(`/api/payouts/quote?points=${points}`),
+  createPayout: (points: number) => request<{ payout: PayoutRequest }>('/api/payouts', json('POST', { points })),
+  payouts: () => request<{ payouts: PayoutRequest[] }>('/api/payouts'),
+  revokePayout: (id: string) => request<{ payout: PayoutRequest }>(`/api/payouts/${id}`, { method: 'DELETE' }),
 
   // ---------- Баллы ----------
   pricing: () => request<Pricing>('/api/pricing'),

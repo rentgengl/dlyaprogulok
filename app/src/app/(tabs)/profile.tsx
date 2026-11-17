@@ -25,6 +25,8 @@ export default function ProfileScreen() {
   const [deletePassword, setDeletePassword] = useState('');
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleted, setDeleted] = useState(false);
+  /** Сервер предупредил: на счёте остались баллы (409 HAS_POINTS). */
+  const [pointsLeft, setPointsLeft] = useState<number | null>(null);
 
   if (!ready) return <View style={layout.screen} />;
 
@@ -87,31 +89,46 @@ export default function ProfileScreen() {
               autoComplete="current-password"
             />
             {deleteError ? <Banner text={deleteError} /> : null}
+            {pointsLeft !== null ? (
+              <>
+                <Banner text={`На счёте ${pointsLeft} баллов — после удаления они пропадут. Сначала подайте заявку на вывод.`} />
+                <Button title="Вывести" icon="wallet-outline" onPress={() => router.push('/wallet')} />
+              </>
+            ) : null}
             <View style={layout.row}>
               <Button
-                title="Удалить навсегда"
+                title={pointsLeft !== null ? 'Удалить всё равно' : 'Удалить навсегда'}
                 icon="trash-outline"
                 variant="danger"
                 loading={busy}
                 disabled={!deletePassword}
                 onPress={async () => {
-                  if (!(await confirm('Удалить аккаунт и все маршруты без возможности восстановления?', 'Удалить'))) return;
+                  if (pointsLeft === null && !(await confirm('Удалить аккаунт и все маршруты без возможности восстановления?', 'Удалить'))) return;
                   setBusy(true);
                   setDeleteError(null);
                   try {
-                    await api.deleteAccount(deletePassword);
+                    await api.deleteAccount(deletePassword, pointsLeft !== null);
                     await forget();
                     setDeleted(true);
                     setDeleting(false);
                     setDeletePassword('');
+                    setPointsLeft(null);
                   } catch (err) {
-                    setDeleteError(err instanceof ApiError ? err.message : 'Не удалось удалить аккаунт');
+                    if (err instanceof ApiError && err.code === 'HAS_POINTS') {
+                      setPointsLeft(Number(err.body.balance ?? 0));
+                    } else {
+                      setDeleteError(err instanceof ApiError ? err.message : 'Не удалось удалить аккаунт');
+                    }
                   } finally {
                     setBusy(false);
                   }
                 }}
               />
-              <Button title="Отмена" variant="secondary" onPress={() => (setDeleting(false), setDeletePassword(''), setDeleteError(null))} />
+              <Button
+                title="Отмена"
+                variant="secondary"
+                onPress={() => (setDeleting(false), setDeletePassword(''), setDeleteError(null), setPointsLeft(null))}
+              />
             </View>
           </View>
         ) : (

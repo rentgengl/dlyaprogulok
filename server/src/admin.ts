@@ -10,7 +10,8 @@ import { z } from 'zod';
 import type { User } from './app.ts';
 import { tx } from './db.ts';
 import { HttpError } from './errors.ts';
-import { saleDecisionMail, type Mailer } from './mail.ts';
+import { capture, release, userAccount } from './ledger.ts';
+import { payoutDecisionMail, saleDecisionMail, type Mailer } from './mail.ts';
 import {
   effectiveEnv,
   isEditable,
@@ -309,6 +310,106 @@ export function registerAdmin(app: FastifyInstance, ctx: AdminContext) {
         .catch((err) => req.log.error(err, 'не удалось отправить письмо о решении'));
     }
     return { route: ctx.fullRoute(ctx.loadRoute(id), admin) };
+  });
+
+  // ---------- Заявки на вывод ----------
+
+  const serializePayout = (r: any) => ({
+    id: r.id,
+    points: r.points,
+    feePct: r.fee_pct,
+    payoutRub: r.payout_kop / 100,
+    status: r.status,
+    createdAt: r.created_at,
+    note: r.admin_note ?? null,
+    decidedAt: r.decided_at ?? null,
+  });
+
+  /** Заявки с данными для решения: пользователь, остаток, доход и последние операции. */
+  app.get('/api/admin/payouts', async (req) => {
+    requireAdmin(req);
+    const { status } = z.object({ status: z.enum(['open', 'paid', 'rejected', 'all']).default('open') }).parse(req.query);
+    const rows = db
+      .prepare(
+        `SELECT p.*, u.email, u.name, u.blocked_at FROM payout_requests p JOIN users u ON u.id = p.user_id
+         ${status === 'all' ? '' : 'WHERE p.status = ?'} ORDER BY p.created_at ${status === 'open' ? 'ASC' : 'DESC'} LIMIT 200`,
+      )
+      .all(...(status === 'all' ? [] : [status])) as any[];
+    const income = db.prepare(
+      `SELECT COALESCE(SUM(e.amount), 0) AS s FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+       WHERE e.account = ? AND e.amount > 0 AND t.kind IN ('route_purchase', 'tip')`,
+    );
+    const recent = db.prepare(
+      `SELECT e.amount, e.created_at, t.kind FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+       WHERE e.account = ? ORDER BY e.id DESC LIMIT 10`,
+    );
+    const balance = db.prepare('SELECT balance FROM wallets WHERE user_id = ?');
+    return {
+      payouts: rows.map((r) => {
+        const account = userAccount(r.user_id);
+        return {
+          ...serializePayout(r),
+          user: {
+            id: r.user_id,
+            email: r.email,
+            name: r.name,
+            blocked: !!r.blocked_at,
+            balance: (balance.get(r.user_id) as { balance: number } | undefined)?.balance ?? 0,
+            income: (income.get(account) as { s: number }).s,
+          },
+          recent: (recent.all(account) as any[]).map((e) => ({ kind: e.kind, amount: e.amount, createdAt: e.created_at })),
+        };
+      }),
+    };
+  });
+
+  /** «Выплачено» — замороженные баллы списываются окончательно; «отклонено» — заморозка снимается (FR-024b). */
+  app.post('/api/admin/payouts/:id/decision', async (req) => {
+    const admin = requireAdmin(req);
+    const { id } = paramsId.parse(req.params);
+    const body = z
+      .object({ decision: z.enum(['paid', 'rejected']), note: z.string().trim().min(1, 'Добавьте комментарий').max(1000) })
+      .parse(req.body);
+    const row = db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id) as any;
+    if (!row) throw new HttpError(404, 'Заявка не найдена');
+    if (row.status !== 'open') throw new HttpError(409, 'Заявка уже закрыта');
+    const ts = now();
+    tx(db, () => {
+      let txId: string | null = null;
+      if (body.decision === 'paid') {
+        txId = capture(
+          db,
+          row.hold_id,
+          row.points,
+          {
+            kind: 'payout',
+            actorId: admin.id,
+            refType: 'payout',
+            refId: id,
+            meta: { title: 'Вывод', feePct: row.fee_pct, payoutRub: row.payout_kop / 100 },
+            entries: [
+              { account: userAccount(row.user_id), amount: -row.points },
+              { account: 'sys:payouts', amount: row.points },
+            ],
+          },
+          { close: true },
+        );
+      } else {
+        release(db, row.hold_id);
+      }
+      db.prepare(
+        'UPDATE payout_requests SET status = ?, admin_note = ?, ledger_tx_id = ?, decided_at = ?, decided_by = ? WHERE id = ?',
+      ).run(body.decision, body.note, txId, ts, admin.id, id);
+    });
+    req.log.info({ admin: admin.id, payout: id, decision: body.decision }, 'решение по заявке на вывод');
+    const user = db.prepare('SELECT email, name, deleted_at FROM users WHERE id = ?').get(row.user_id) as any;
+    const mailer = ctx.mailer();
+    if (mailer && user && !user.deleted_at) {
+      await mailer
+        .send(payoutDecisionMail(user.email, user.name, body.decision, row.points, row.payout_kop / 100, body.note, `${ctx.status().appUrl}/wallet`))
+        .catch((err) => req.log.error(err, 'не удалось отправить письмо о выводе'));
+    }
+    return { payout: serializePayout(db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id)) };
   });
 
   // ---------- Маршруты ----------

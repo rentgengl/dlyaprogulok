@@ -146,13 +146,13 @@ description: "Задачи реализации монетизации (002)"
 
 ### Tests for User Story 3 ⚠️
 
-- [ ] T041 [P] [US3] Тесты премий в `server/test/money.test.ts`: 50 баллов → −50 / +40 / +10; сообщение > 200 символов — 400; сумма вне `TIP_MIN…TIP_MAX` — 400; себе — 400; премия по чужому приватному или закрытому неоткрытому маршруту — 404; история автора показывает имя отправителя, маршрут и сообщение
+- [X] T041 [P] [US3] Тесты премий в `server/test/money.test.ts`: 50 баллов → −50 / +40 / +10; сообщение > 200 символов — 400; сумма вне `TIP_MIN…TIP_MAX` — 400; себе — 400; премия по чужому приватному или закрытому неоткрытому маршруту — 404; история автора показывает имя отправителя, маршрут и сообщение
 
 ### Implementation for User Story 3
 
-- [ ] T042 [US3] В `server/src/money.ts` реализовать `POST /api/tips` (`requireSpender`, лимит 30/час, `expectedCost = amount`, маршрут должен быть виден отправителю через `canView`, сообщение — обрезка пробелов, без HTML, ≤ 200, видно только автору и администраторам (FR-022); проводка `tip` через `splitShare(amount, SALE_COMMISSION_PCT)`, запись `tips`) и `GET /api/authors/:id` (имя и публичные маршруты; для обезличенного — «Удалённый автор» без маршрутов)
-- [ ] T043 [P] [US3] Компонент `app/src/components/TipSheet.tsx` (суммы 30/50/100 и своя, сообщение до 200 символов, подтверждение через `PriceConfirm`); кнопка «Поддержать автора» на `app/src/app/route/[id].tsx` (нет на своём маршруте); имя автора — ссылка на страницу автора
-- [ ] T044 [P] [US3] Страница автора `app/src/app/author/[id].tsx` (регистрация в `app/src/app/_layout.tsx`): имя, список маршрутов (`RouteCard`), «Поддержать автора»; метод `author(id)` и `sendTip` в `app/src/lib/api.ts`
+- [X] T042 [US3] В `server/src/money.ts` реализовать `POST /api/tips` (`requireSpender`, лимит 30/час, `expectedCost = amount`, маршрут должен быть виден отправителю через `canView`, сообщение — обрезка пробелов, без HTML, ≤ 200, видно только автору и администраторам (FR-022); проводка `tip` через `splitShare(amount, SALE_COMMISSION_PCT)`, запись `tips`) и `GET /api/authors/:id` (имя и публичные маршруты; для обезличенного — «Удалённый автор» без маршрутов)
+- [X] T043 [P] [US3] Компонент `app/src/components/TipSheet.tsx` (суммы 30/50/100 и своя, сообщение до 200 символов, подтверждение через `PriceConfirm`); кнопка «Поддержать автора» на `app/src/app/route/[id].tsx` (нет на своём маршруте); имя автора — ссылка на страницу автора
+- [X] T044 [P] [US3] Страница автора `app/src/app/author/[id].tsx` (регистрация в `app/src/app/_layout.tsx`): имя, список маршрутов (`RouteCard`), «Поддержать автора»; метод `author(id)` и `sendTip` в `app/src/lib/api.ts`
 
 **Checkpoint**: премии работают; quickstart 4 проходит
 
@@ -166,16 +166,23 @@ description: "Задачи реализации монетизации (002)"
 
 ### Tests for User Story 4 ⚠️
 
-- [ ] T045 [P] [US4] Тесты вывода в `server/test/money.test.ts`: квота 1000 баллов при 5 % → к выплате 950 ₽; меньше `PAYOUT_MIN` — 400; вторая открытая заявка — 409; замороженные баллы нельзя потратить (402); «выплачено» → проводка `payout`, письмо; «отклонено» и отзыв пользователем → заморозка снята; комиссия фиксируется при подаче и не меняется при смене настройки; заблокированный — `WALLET_FROZEN`; `DELETE /api/payouts/:id` чужой заявки — 404; не-администратор получает 403 на `GET /api/admin/payouts` и `POST /api/admin/payouts/:id/decision`
+- [X] T045 [P] [US4] Тесты вывода в `server/test/money.test.ts`: квота 1000 баллов при 5 % → к выплате 950 ₽; меньше `PAYOUT_MIN` — 400; вторая открытая заявка — 409; замороженные баллы нельзя потратить (402); «выплачено» → проводка `payout`, письмо; «отклонено» и отзыв пользователем → заморозка снята; комиссия фиксируется при подаче и не меняется при смене настройки; заблокированный — `WALLET_FROZEN`; `DELETE /api/payouts/:id` чужой заявки — 404; не-администратор получает 403 на `GET /api/admin/payouts` и `POST /api/admin/payouts/:id/decision`
 
 ### Implementation for User Story 4
 
-- [ ] T046 [US4] В `server/src/money.ts` реализовать `GET /api/payouts/quote`, `POST /api/payouts` (лимит 5/сутки, `requireSpender`, `points ≥ PAYOUT_MIN` и `≤ available`, заморозка `hold(kind 'payout')`, `fee_pct` и `payout_kop` фиксируются), `GET /api/payouts`, `DELETE /api/payouts/:id` (отзыв открытой); `incomeThisMonth` в `GET /api/wallet` — сумма долей автора за календарный месяц по Москве (`monthWindow`)
-- [ ] T047 [US4] Админка заявок в `server/src/admin.ts`: `GET /api/admin/payouts?status=open` (с доходом и последними операциями пользователя) и `POST /api/admin/payouts/:id/decision` (`paid` → `capture` заморозки проводкой `payout`: `user −N`, `sys:payouts +N`; `rejected` → `release`; `note` обязателен); письмо — `payoutDecisionMail(...)` в `server/src/mail.ts`
-- [ ] T048 [P] [US4] Предупреждение при удалении аккаунта в `app/src/app/(tabs)/profile.tsx`: на `409 HAS_POINTS` показать «На счёте N баллов — они пропадут. Сначала подайте заявку на вывод» с кнопками «Вывести» (переход на `/wallet`) и «Удалить всё равно» (повтор с `force: true`). Блок «Вывод» на `app/src/app/wallet.tsx` (сумма, расчёт «к выплате X ₽, комиссия Y ₽» из `payouts/quote`, статус открытой заявки, отзыв) и раздел «Доход за месяц»; методы в `app/src/lib/api.ts`
-- [ ] T049 [P] [US4] Админка `app/src/app/admin/payouts.tsx` (список открытых и закрытых, «Выплачено»/«Отклонить» с комментарием), пункт меню, методы в `app/src/lib/adminApi.ts`
+- [X] T046 [US4] В `server/src/money.ts` реализовать `GET /api/payouts/quote`, `POST /api/payouts` (лимит 5/сутки, `requireSpender`, `points ≥ PAYOUT_MIN` и `≤ available`, заморозка `hold(kind 'payout')`, `fee_pct` и `payout_kop` фиксируются), `GET /api/payouts`, `DELETE /api/payouts/:id` (отзыв открытой); `incomeThisMonth` в `GET /api/wallet` — сумма долей автора за календарный месяц по Москве (`monthWindow`)
+- [X] T047 [US4] Админка заявок в `server/src/admin.ts`: `GET /api/admin/payouts?status=open` (с доходом и последними операциями пользователя) и `POST /api/admin/payouts/:id/decision` (`paid` → `capture` заморозки проводкой `payout`: `user −N`, `sys:payouts +N`; `rejected` → `release`; `note` обязателен); письмо — `payoutDecisionMail(...)` в `server/src/mail.ts`
+- [X] T048 [P] [US4] Предупреждение при удалении аккаунта в `app/src/app/(tabs)/profile.tsx`: на `409 HAS_POINTS` показать «На счёте N баллов — они пропадут. Сначала подайте заявку на вывод» с кнопками «Вывести» (переход на `/wallet`) и «Удалить всё равно» (повтор с `force: true`). Блок «Вывод» на `app/src/app/wallet.tsx` (сумма, расчёт «к выплате X ₽, комиссия Y ₽» из `payouts/quote`, статус открытой заявки, отзыв) и раздел «Доход за месяц»; методы в `app/src/lib/api.ts`
+- [X] T049 [P] [US4] Админка `app/src/app/admin/payouts.tsx` (список открытых и закрытых, «Выплачено»/«Отклонить» с комментарием), пункт меню, методы в `app/src/lib/adminApi.ts`
 
 **Checkpoint**: вывод работает; quickstart 5 проходит
+
+Отклонения при реализации US3–US4:
+- Компонент премии — `TipButton` в `app/src/components/TipSheet.tsx` (кнопка и окно вместе).
+- Разметка в сообщении премии вырезается, а не отклоняется; длина проверяется после очистки.
+- В истории операций у отправителя премии контрагент — автор, у автора — отправитель.
+- `GET /api/admin/payouts` принимает `status=open|paid|rejected|all`; к заявке приложены остаток, доход за всё время и 10 последних операций пользователя.
+- Заблокированный пользователь получает 401, а не `WALLET_FROZEN`: блокировка закрывает сессии (как в US2).
 
 ---
 
