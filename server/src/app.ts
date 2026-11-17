@@ -24,7 +24,8 @@ import { passwordResetMail, verificationMail, type Mailer } from './mail.ts';
 import { factsSource, factsStory, mergeFacts, type Fact, type PlacePhoto } from './places.ts';
 import { legendSections, normalize, type GeoServices } from './services.ts';
 import { injectShareMeta, routeFacts } from './share.ts';
-import { capture, findHold, hold, release, userAccount } from './ledger.ts';
+import { available, balanceOf, capture, findHold, hold, release, userAccount } from './ledger.ts';
+import { createMediaSigner, mediaSigningKey, registerMedia } from './media.ts';
 import { checkExpected, registerMoney, requireSpender, walletBrief, type MoneyContext } from './money.ts';
 import {
   narrationCost,
@@ -282,15 +283,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   await app.register(rateLimit, { global: false });
   await app.register(multipart, { limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 5 } });
 
-  await app.register(fastifyStatic, {
-    root: path.resolve(uploadsDir),
-    prefix: '/media/',
-    setHeaders(res) {
-      res.header('X-Content-Type-Options', 'nosniff');
-      res.header('Content-Security-Policy', "default-src 'none'; sandbox");
-      res.header('Cross-Origin-Resource-Policy', 'cross-origin');
-    },
-  });
+  // Только reply.sendFile: сами файлы отдаёт registerMedia, проверяя подпись у платных маршрутов.
+  await app.register(fastifyStatic, { root: path.resolve(uploadsDir), serve: false });
+  const mediaSigner = createMediaSigner(mediaSigningKey(db, deps.baseEnv ?? {}));
+  registerMedia(app, { db, signer: mediaSigner });
   await app.register(fastifyStatic, {
     root: path.join(here, '..', 'public'),
     prefix: '/map/',
@@ -342,6 +338,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     mailer: () => mailer,
     appUrl: () => appUrl,
     log: app.log,
+    routes: { load: loadRouteRow, owned: ownedRoute, full: fullRoute },
   };
   /** Платные действия включены, только когда подключён платёжный шлюз; иначе всё как до монетизации. */
   const charging = () => !!payments.provider;
@@ -467,12 +464,50 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     pointCount: r.point_count,
     rating: { avg: r.rating_avg === null ? null : Math.round(r.rating_avg * 10) / 10, count: r.rating_count },
     createdAt: r.created_at,
+    price: r.price ?? null,
   });
 
-  const serializeMedia = (m: any) => ({
+  /** Маршруты, открытые зрителем (куплены или свои): для пометки «Куплен» в списках. */
+  function withOwned(rows: any[], viewer: User | null) {
+    if (!viewer || !rows.length) return rows.map((r) => ({ ...summary(r), owned: false }));
+    const bought = new Set(
+      (
+        db
+          .prepare(`SELECT route_id FROM route_purchases WHERE user_id = ? AND route_id IN (${rows.map(() => '?').join(', ')})`)
+          .all(viewer.id, ...rows.map((r) => r.id)) as { route_id: string }[]
+      ).map((r) => r.route_id),
+    );
+    return rows.map((r) => ({ ...summary(r), owned: r.owner_id === viewer.id || bought.has(r.id) }));
+  }
+
+  /** Условие каталога: открыт, не удалён, бесплатный или одобренный платный (research R12). */
+  const LISTED = `r.is_public = 1 AND r.deleted_at IS NULL AND (r.price IS NULL OR r.sale_status = 'approved')`;
+
+  const purchased = (routeId: string, userId: string) =>
+    !!db.prepare('SELECT 1 FROM route_purchases WHERE route_id = ? AND user_id = ?').get(routeId, userId);
+
+  /**
+   * Доступ к маршруту (research R10): full — всё содержимое; preview — только превью платного маршрута;
+   * null — маршрута для зрителя нет. Покупатель сохраняет доступ при любых изменениях и удалении (FR-014).
+   */
+  function routeAccess(row: any, viewer: User | null): 'full' | 'preview' | null {
+    if (!row) return null;
+    const bought = !!viewer && purchased(row.id, viewer.id);
+    if (row.deleted_at) return bought || viewer?.isAdmin ? 'full' : null;
+    if (bought || viewer?.id === row.owner_id || viewer?.isAdmin) return 'full';
+    if (!row.is_public) return null;
+    if (row.price === null || row.price === undefined) return 'full';
+    return row.sale_status === 'approved' ? 'preview' : null;
+  }
+  const canView = (row: any, viewer: User | null) => routeAccess(row, viewer) === 'full';
+
+  /** Ссылка на файл; у платного маршрута — подписанная (зритель уже прошёл проверку доступа). */
+  const fileUrl = (file: string, paid: boolean) => (paid ? mediaSigner.sign(file) : `/media/${file}`);
+
+  const serializeMedia = (m: any, paid = false) => ({
     id: m.id,
     kind: m.kind,
-    url: `/media/${m.file_name}`,
+    url: fileUrl(m.file_name, paid),
     mime: m.mime,
     size: m.size,
     caption: m.caption,
@@ -510,6 +545,28 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   }
 
   function fullRoute(row: any, viewer: User | null) {
+    const access = routeAccess(row, viewer);
+    if (access !== 'full') {
+      // Превью закрытого маршрута: без точек, линии и финиша; обложка — первое фото с автором и лицензией.
+      const first = db
+        .prepare('SELECT photo FROM points WHERE route_id = ? AND photo IS NOT NULL ORDER BY position LIMIT 1')
+        .get(row.id) as { photo: string } | undefined;
+      return {
+        ...summary(row),
+        finish: null,
+        locked: true,
+        owned: false,
+        cover: parseJson<PlacePhoto>(first?.photo ?? null),
+        geometry: null,
+        myRating: null,
+        isOwner: false,
+        canEdit: false,
+        job: null,
+        points: [],
+      };
+    }
+    const paid = row.price !== null && row.price !== undefined;
+    const staff = viewer?.id === row.owner_id || !!viewer?.isAdmin;
     const points = db.prepare('SELECT * FROM points WHERE route_id = ? ORDER BY position').all(row.id) as any[];
     const media = db
       .prepare(
@@ -528,6 +585,18 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       canEdit: viewer?.id === row.owner_id || !!viewer?.isAdmin,
       // Фоновая задача по маршруту: идущая или закончившаяся недавно (чтобы показать итог).
       job: viewer?.id === row.owner_id || viewer?.isAdmin ? routeJob(row.id) : null,
+      locked: false,
+      owned: !!viewer && (viewer.id === row.owner_id || purchased(row.id, viewer.id)),
+      deletedByAuthor: !!row.deleted_at,
+      // Автору и администратору — статус проверки и число покупателей.
+      ...(staff
+        ? {
+            sale: row.sale_status
+              ? { status: row.sale_status, note: row.sale_note ?? null, decidedAt: row.sale_decided_at ?? null }
+              : null,
+            buyers: (db.prepare('SELECT COUNT(*) AS n FROM route_purchases WHERE route_id = ?').get(row.id) as { n: number }).n,
+          }
+        : {}),
       points: points.map((p) => {
         const own = media.filter((m) => m.point_id === p.id);
         const narration = own.find((m) => m.is_narration);
@@ -544,8 +613,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           storySourceUrl: p.story_source_url,
           // Рассказы до появления выбора были фактическими.
           storyStyle: p.story_style ?? (p.story && p.story_source !== 'author' ? 'facts' : null),
-          narrationUrl: narration ? `/media/${narration.file_name}` : null,
-          media: own.filter((m) => !m.is_narration).map(serializeMedia),
+          narrationUrl: narration ? fileUrl(narration.file_name, paid) : null,
+          media: own.filter((m) => !m.is_narration).map((m) => serializeMedia(m, paid)),
           photo: parseJson<PlacePhoto>(p.photo),
           wikidata: p.wikidata ?? null,
           heritageRef: p.heritage_ref ?? null,
@@ -554,16 +623,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     };
   }
 
-  /** Чужие приватные маршруты неотличимы от несуществующих. */
+  /** Чужие приватные маршруты неотличимы от несуществующих; закрытый платный — виден превью. */
   function visibleRoute(id: string, viewer: User | null): any {
     const row = loadRouteRow(id);
-    if (!row || (!row.is_public && row.owner_id !== viewer?.id && !viewer?.isAdmin)) throw new HttpError(404, 'Маршрут не найден');
+    if (!routeAccess(row, viewer)) throw new HttpError(404, 'Маршрут не найден');
     return row;
   }
 
   function ownedRoute(id: string, user: User): any {
     const row = visibleRoute(id, user);
+    // Закрытый платный маршрут для постороннего — как несуществующий.
+    if (!canView(row, user)) throw new HttpError(404, 'Маршрут не найден');
     if (row.owner_id !== user.id && !user.isAdmin) throw new HttpError(403, 'Изменять маршрут может только автор');
+    // Удалённый автором маршрут (остался у покупателей) не правится.
+    if (row.deleted_at) throw new HttpError(404, 'Маршрут не найден');
     return row;
   }
 
@@ -710,7 +783,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const rows = db
       .prepare(
         `SELECT city AS name, COUNT(*) AS count, AVG(start_lat) AS lat, AVG(start_lng) AS lng
-         FROM routes WHERE is_public = 1 AND city IS NOT NULL AND city != ''
+         FROM routes r WHERE ${LISTED} AND city IS NOT NULL AND city != ''
          GROUP BY city ORDER BY count DESC, city LIMIT 100`,
       )
       .all() as any[];
@@ -887,22 +960,73 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return { token: createSession(row.id), user: publicUser(user) };
   });
 
+  /**
+   * Удаление аккаунта (research R11). Если у автора есть проданные маршруты, аккаунт обезличивается:
+   * проданные маршруты остаются у покупателей, остальные удаляются вместе с файлами. Иначе — удаляется
+   * полностью. Журнал баллов не удаляется никогда.
+   */
+  async function removeAccount(userId: string): Promise<'deleted' | 'anonymized'> {
+    const sold = db
+      .prepare('SELECT DISTINCT r.id FROM routes r JOIN route_purchases rp ON rp.route_id = r.id WHERE r.owner_id = ?')
+      .all(userId) as { id: string }[];
+    if (!sold.length) {
+      const files = db
+        .prepare('SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id JOIN routes r ON r.id = p.route_id WHERE r.owner_id = ?')
+        .all(userId) as any[];
+      db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+      await removeFiles(files.map((f) => f.file_name));
+      return 'deleted';
+    }
+    const keep = new Set(sold.map((r) => r.id));
+    const others = (db.prepare('SELECT id FROM routes WHERE owner_id = ?').all(userId) as { id: string }[]).filter((r) => !keep.has(r.id));
+    const files = others.length
+      ? (db
+          .prepare(
+            `SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id WHERE p.route_id IN (${others.map(() => '?').join(', ')})`,
+          )
+          .all(...others.map((r) => r.id)) as any[])
+      : [];
+    const hash = await hashPassword(randomBytes(32).toString('hex'));
+    const ts = now();
+    tx(db, () => {
+      for (const r of others) db.prepare('DELETE FROM routes WHERE id = ?').run(r.id);
+      // Проданные маршруты исчезают у автора и из каталога, но остаются у покупателей.
+      db.prepare('UPDATE routes SET deleted_at = COALESCE(deleted_at, ?), is_public = 0 WHERE owner_id = ?').run(ts, userId);
+      db.prepare(
+        `UPDATE users SET email = ?, name = 'Удалённый автор', password_hash = ?, role = 'user', deleted_at = ? WHERE id = ?`,
+      ).run(`deleted-${userId}@invalid`, hash, ts, userId);
+      for (const table of ['sessions', 'email_tokens', 'password_resets', 'ratings']) {
+        db.prepare(`DELETE FROM ${table} WHERE user_id = ?`).run(userId);
+      }
+    });
+    await removeFiles(files.map((f) => f.file_name));
+    return 'anonymized';
+  }
+
   /** Удаление своего аккаунта со всеми маршрутами, оценками и файлами. Нужен пароль. */
   app.delete('/api/me', authLimit, async (req, reply) => {
     const user = requireUser(req);
-    const { password } = z.object({ password: z.string().min(1, 'Введите пароль').max(200) }).parse(req.body ?? {});
+    const { password, force } = z
+      .object({ password: z.string().min(1, 'Введите пароль').max(200), force: z.boolean().default(false) })
+      .parse(req.body ?? {});
     const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id) as any;
     if (!(await checkPassword(password, row.password_hash))) throw new HttpError(403, 'Неверный пароль');
     if (user.isAdmin) {
       const admins = (db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND blocked_at IS NULL").get() as any).n;
       if (admins <= 1) throw new HttpError(409, 'Вы единственный администратор: сначала передайте права другому пользователю в админке.');
     }
-    const files = db
-      .prepare('SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id JOIN routes r ON r.id = p.route_id WHERE r.owner_id = ?')
-      .all(user.id) as any[];
-    db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
-    await removeFiles(files.map((f) => f.file_name));
-    req.log.info({ user: user.id }, 'пользователь удалил аккаунт');
+    // Баллы сгорают: сначала предупреждение и предложение вывести их (FR-030).
+    const openPayout = db.prepare("SELECT 1 FROM payout_requests WHERE user_id = ? AND status = 'open'").get(user.id);
+    if (!force && (available(db, user.id) > 0 || openPayout)) {
+      throw new HttpError(
+        409,
+        'На счёте остались баллы. После удаления аккаунта они пропадут: сначала оформите вывод или подтвердите удаление.',
+        'HAS_POINTS',
+        { balance: balanceOf(db, user.id) },
+      );
+    }
+    const result = await removeAccount(user.id);
+    req.log.info({ user: user.id, result }, 'пользователь удалил аккаунт');
     return reply.status(204).send();
   });
 
@@ -1368,7 +1492,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       })
       .parse(req.query);
 
-    const where = ['r.is_public = 1'];
+    const where = [LISTED];
     const args: (string | number)[] = [];
     if (q.q) {
       const like = `%${q.q.replace(/[\\%_]/g, '\\$&')}%`;
@@ -1395,8 +1519,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         `SELECT ${ROUTE_COLUMNS} FROM routes r JOIN users u ON u.id = r.owner_id
          WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT ? OFFSET ?`,
       )
-      .all(...args, q.limit, q.offset);
-    return { routes: rows.map(summary) };
+      .all(...args, q.limit, q.offset) as any[];
+    return { routes: withOwned(rows, req.user) };
   });
 
   app.get('/api/routes/mine', async (req) => {
@@ -1404,10 +1528,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const rows = db
       .prepare(
         `SELECT ${ROUTE_COLUMNS} FROM routes r JOIN users u ON u.id = r.owner_id
-         WHERE r.owner_id = ? ORDER BY r.created_at DESC LIMIT 200`,
+         WHERE r.owner_id = ? AND r.deleted_at IS NULL ORDER BY r.created_at DESC LIMIT 200`,
       )
-      .all(user.id);
-    return { routes: rows.map(summary) };
+      .all(user.id) as any[];
+    return { routes: withOwned(rows, user) };
   });
 
   app.get('/api/routes/:id', async (req) => {
@@ -1448,6 +1572,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const user = requireUser(req);
     const { id } = paramsId.parse(req.params);
     ownedRoute(id, user);
+    // Есть покупатели — маршрут остаётся у них (FR-014): скрывается, файлы не удаляются (research R11).
+    if (db.prepare('SELECT 1 FROM route_purchases WHERE route_id = ? LIMIT 1').get(id)) {
+      db.prepare('UPDATE routes SET deleted_at = ?, is_public = 0, updated_at = ? WHERE id = ?').run(now(), now(), id);
+      return reply.status(204).send();
+    }
     const files = db
       .prepare('SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id WHERE p.route_id = ?')
       .all(id) as any[];
@@ -1462,6 +1591,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const { value } = z.object({ value: z.number().int().min(1).max(5) }).parse(req.body);
     const row = visibleRoute(id, user);
     if (row.owner_id === user.id) throw new HttpError(403, 'Нельзя оценивать собственный маршрут');
+    // Платный маршрут оценивают только открывшие его (FR-017).
+    if (!canView(row, user)) throw new HttpError(403, 'Оценить маршрут можно после того, как вы его откроете');
     if (!row.is_public) throw new HttpError(404, 'Маршрут не найден');
     db.prepare(
       `INSERT INTO ratings (route_id, user_id, value, updated_at) VALUES (?, ?, ?, ?)
@@ -1700,6 +1831,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const { id } = paramsId.parse(req.params);
     const { format } = z.object({ format: z.enum(['gpx', 'kml']) }).parse(req.query);
     const row = visibleRoute(id, req.user);
+    if (!canView(row, req.user)) throw new HttpError(404, 'Маршрут не найден');
     const data = {
       title: row.title,
       description: row.description,
@@ -1755,7 +1887,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         `SELECT p.*,
            (SELECT m.file_name FROM media m WHERE m.point_id = p.id AND m.is_narration = 1 AND m.voice = ?) AS narration_file
          FROM points p JOIN routes r ON r.id = p.route_id
-         WHERE p.id != ? AND r.lang = ? AND p.story_style = ? AND p.story IS NOT NULL AND p.story_version >= ?
+         WHERE p.id != ? AND r.price IS NULL AND r.lang = ? AND p.story_style = ? AND p.story IS NOT NULL AND p.story_version >= ?
            AND p.story_source IN (${SHARED_SOURCES.map(() => '?').join(', ')})
            AND (${keys.join(' OR ')})
          ORDER BY narration_file IS NULL, r.updated_at DESC
@@ -2037,7 +2169,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const parsed = paramsId.safeParse(req.params);
     const row = parsed.success ? loadRouteRow(parsed.data.id) : null;
     let page = html;
-    if (row?.is_public) {
+    // Превью для мессенджеров — только у маршрутов из каталога; у платных — без содержимого.
+    if (row && routeAccess(row, null)) {
       const first = db
         .prepare('SELECT photo FROM points WHERE route_id = ? AND photo IS NOT NULL ORDER BY position LIMIT 1')
         .get(row.id) as any;
@@ -2131,6 +2264,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       appUrl,
     }),
     mailer: () => mailer,
+    fullRoute,
+    loadRoute: loadRouteRow,
+    removeAccount,
   });
 
   return app;

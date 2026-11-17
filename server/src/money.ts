@@ -9,10 +9,10 @@ import { z } from 'zod';
 import type { User } from './app.ts';
 import { tx } from './db.ts';
 import { HttpError } from './errors.ts';
-import { available, balanceOf, heldOf, post, release, userAccount } from './ledger.ts';
+import { available, balanceOf, heldOf, post, release, spend, userAccount } from './ledger.ts';
 import type { Mailer } from './mail.ts';
 import { createGateway, isYookassaIp, type FakeGateway, type PaymentGateway, type ProviderPayment } from './payments.ts';
-import type { Pricing } from './pricing.ts';
+import { splitShare, type Pricing } from './pricing.ts';
 import type { PaymentsConfig } from './settings.ts';
 
 export interface MoneyContext {
@@ -25,6 +25,12 @@ export interface MoneyContext {
   mailer: () => Mailer | null;
   appUrl: () => string;
   log: FastifyBaseLogger;
+  /** Маршруты из app.ts: загрузка строки, проверка автора и сериализация с учётом доступа. */
+  routes: {
+    load: (id: string) => any;
+    owned: (id: string, user: User) => any;
+    full: (row: any, viewer: User | null) => unknown;
+  };
 }
 
 const nowIso = () => new Date().toISOString();
@@ -260,6 +266,84 @@ export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
     else fake.cancel(row.provider_id, 'canceled_by_user');
     applyProviderStatus(row.id, await fake.getPayment(row.provider_id), req.log);
     return { payment: serializePayment(ownPayment(id, user)) };
+  });
+
+  // ---------- Платные маршруты ----------
+
+  const routeParams = z.object({ id: z.string().uuid() });
+
+  /**
+   * Цена маршрута (FR-012, FR-012b). Число — заявка на проверку (pending); у одобренного маршрута новая
+   * цена действует сразу. null — маршрут снова бесплатный.
+   */
+  app.put('/api/routes/:id/price', async (req) => {
+    const user = ctx.requireVerified(req);
+    const { id } = routeParams.parse(req.params);
+    const p = ctx.pricing();
+    const { price } = z
+      .object({
+        price: z
+          .number()
+          .int('Цена — целое число баллов')
+          .min(p.routePriceMin, `Цена — от ${p.routePriceMin} баллов`)
+          .max(p.routePriceMax, `Цена — не больше ${p.routePriceMax} баллов`)
+          .nullable(),
+      })
+      .parse(req.body);
+    // Чужой маршрут — как несуществующий (contracts/api.md), даже если он открыт в каталоге.
+    const own = ctx.routes.load(id);
+    if (!own || (own.owner_id !== user.id && !user.isAdmin)) throw new HttpError(404, 'Маршрут не найден');
+    const row = ctx.routes.owned(id, user);
+    const ts = nowIso();
+    if (price === null) {
+      db.prepare('UPDATE routes SET price = NULL, sale_status = NULL, sale_note = NULL, updated_at = ? WHERE id = ?').run(ts, id);
+    } else {
+      if (!db.prepare('SELECT 1 FROM points WHERE route_id = ? LIMIT 1').get(id)) {
+        throw new HttpError(409, 'Добавьте в маршрут хотя бы одно место, прежде чем назначать цену');
+      }
+      const keepStatus = row.sale_status === 'approved' || row.sale_status === 'pending';
+      db.prepare(
+        `UPDATE routes SET price = ?, sale_status = ?, sale_note = ${keepStatus ? 'sale_note' : 'NULL'}, updated_at = ? WHERE id = ?`,
+      ).run(price, keepStatus ? row.sale_status : 'pending', ts, id);
+    }
+    return { route: ctx.routes.full(ctx.routes.load(id), user) };
+  });
+
+  /** Открытие платного маршрута за баллы (FR-014, FR-016): цена минус комиссия — автору. */
+  app.post('/api/routes/:id/purchase', { config: { rateLimit: { max: 30, timeWindow: '1 hour' } } }, async (req, reply) => {
+    const user = requireSpender(ctx, req);
+    const { id } = routeParams.parse(req.params);
+    const { expectedCost } = z.object({ expectedCost: z.number().int().min(0).optional() }).parse(req.body ?? {});
+    const row = ctx.routes.load(id);
+    if (!row || row.deleted_at) throw new HttpError(404, 'Маршрут не найден');
+    const owned = row.owner_id === user.id || db.prepare('SELECT 1 FROM route_purchases WHERE route_id = ? AND user_id = ?').get(id, user.id);
+    if (owned) throw new HttpError(409, 'Маршрут уже открыт', 'ALREADY_OWNED');
+    if (row.price === null || row.sale_status !== 'approved' || !row.is_public) throw new HttpError(404, 'Маршрут не найден');
+    checkExpected(row.price, expectedCost);
+    const price: number = row.price;
+    const share = splitShare(price, ctx.pricing().saleCommissionPct);
+    tx(db, () => {
+      // Повторная проверка внутри транзакции: два одновременных запроса не спишут дважды.
+      if (db.prepare('SELECT 1 FROM route_purchases WHERE route_id = ? AND user_id = ?').get(id, user.id)) {
+        throw new HttpError(409, 'Маршрут уже открыт', 'ALREADY_OWNED');
+      }
+      const txId = spend(db, user.id, price, {
+        kind: 'route_purchase',
+        actorId: user.id,
+        refType: 'route',
+        refId: id,
+        meta: { routeId: id, routeTitle: row.title, commission: share.commission },
+        entries: [
+          { account: userAccount(user.id), amount: -price },
+          { account: userAccount(row.owner_id), amount: share.author },
+          { account: 'sys:revenue', amount: share.commission },
+        ],
+      });
+      db.prepare(
+        'INSERT INTO route_purchases (route_id, user_id, price, author_share, ledger_tx_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      ).run(id, user.id, price, share.author, txId, nowIso());
+    });
+    return reply.status(201).send({ route: ctx.routes.full(ctx.routes.load(id), user) });
   });
 
   // ---------- Фоновая сверка ----------

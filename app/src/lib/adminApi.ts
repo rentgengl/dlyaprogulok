@@ -1,5 +1,5 @@
 import { adminRequest } from './api';
-import type { Quota, RouteSummary, StoryStyle } from './types';
+import type { Quota, Route, RouteSummary, SaleStatus, StoryStyle } from './types';
 
 export interface AdminStats {
   users: { total: number; verified: number; blocked: number; admins: number; newThisMonth: number };
@@ -85,6 +85,10 @@ export const adminApi = {
   logoutUser: (id: string) => adminRequest<{ closed: number }>(`/api/admin/users/${id}/logout`, { method: 'POST' }),
   deleteUser: (id: string) => adminRequest<void>(`/api/admin/users/${id}`, { method: 'DELETE' }),
 
+  /** Очередь проверки платных маршрутов: с полным содержимым. */
+  paidRoutes: (status: SaleStatus = 'pending') => adminRequest<{ routes: Route[] }>(`/api/admin/paid-routes?status=${status}`),
+  saleDecision: (id: string, decision: 'approve' | 'reject' | 'delist', note?: string) =>
+    adminRequest<{ route: Route }>(`/api/admin/paid-routes/${id}/decision`, body('POST', { decision, note })),
   routes: (p: { q?: string; owner?: string; visibility?: string; sort?: string; offset?: number; limit?: number }) =>
     adminRequest<{ total: number; routes: AdminRoute[] }>(`/api/admin/routes?${qs(p)}`),
   updateRoute: (

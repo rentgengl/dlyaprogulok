@@ -10,7 +10,7 @@ import { z } from 'zod';
 import type { User } from './app.ts';
 import { tx } from './db.ts';
 import { HttpError } from './errors.ts';
-import type { Mailer } from './mail.ts';
+import { saleDecisionMail, type Mailer } from './mail.ts';
 import {
   effectiveEnv,
   isEditable,
@@ -40,6 +40,11 @@ export interface AdminContext {
     appUrl: string;
   };
   mailer: () => Mailer | null;
+  /** Полный маршрут для администратора (с содержимым платного). */
+  fullRoute: (row: any, viewer: User) => unknown;
+  loadRoute: (id: string) => any;
+  /** Удаление или обезличивание аккаунта (research R11). */
+  removeAccount: (userId: string) => Promise<'deleted' | 'anonymized'>;
 }
 
 const now = () => new Date().toISOString();
@@ -242,15 +247,68 @@ export function registerAdmin(app: FastifyInstance, ctx: AdminContext) {
     const { id } = paramsId.parse(req.params);
     if (id === me.id) throw new HttpError(409, 'Нельзя удалить свой аккаунт из админки');
     loadUser(id);
-    const files = db
-      .prepare(
-        `SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id JOIN routes r ON r.id = p.route_id WHERE r.owner_id = ?`,
-      )
-      .all(id) as any[];
-    db.prepare('DELETE FROM users WHERE id = ?').run(id);
-    await ctx.removeFiles(files.map((f) => f.file_name));
-    req.log.info({ admin: me.id, user: id }, 'админ удалил пользователя');
+    // Проданные маршруты остаются у покупателей: такой аккаунт обезличивается.
+    const result = await ctx.removeAccount(id);
+    req.log.info({ admin: me.id, user: id, result }, 'админ удалил пользователя');
     return reply.status(204).send();
+  });
+
+  // ---------- Платные маршруты: проверка ----------
+
+  app.get('/api/admin/paid-routes', async (req) => {
+    const admin = requireAdmin(req);
+    const { status } = z
+      .object({ status: z.enum(['pending', 'approved', 'rejected', 'delisted']).default('pending') })
+      .parse(req.query);
+    const rows = db
+      .prepare(
+        `SELECT ${ctx.routeColumns} FROM routes r JOIN users u ON u.id = r.owner_id
+         WHERE r.sale_status = ? AND r.deleted_at IS NULL ORDER BY r.updated_at ${status === 'pending' ? 'ASC' : 'DESC'} LIMIT 200`,
+      )
+      .all(status) as any[];
+    return { routes: rows.map((r) => ctx.fullRoute(r, admin)) };
+  });
+
+  app.post('/api/admin/paid-routes/:id/decision', async (req) => {
+    const admin = requireAdmin(req);
+    const { id } = paramsId.parse(req.params);
+    const body = z
+      .object({ decision: z.enum(['approve', 'reject', 'delist']), note: z.string().trim().max(1000).optional() })
+      .refine((b) => b.decision === 'approve' || !!b.note, { message: 'Укажите причину' })
+      .parse(req.body);
+    const row = ctx.loadRoute(id);
+    if (!row || row.deleted_at || !row.sale_status) throw new HttpError(404, 'Заявка не найдена');
+    const allowed = { approve: ['pending', 'delisted'], reject: ['pending'], delist: ['approved'] }[body.decision];
+    if (!allowed.includes(row.sale_status)) throw new HttpError(409, 'Это решение для маршрута в таком статусе недоступно');
+    const ts = now();
+    const note = body.note || null;
+    if (body.decision === 'approve') {
+      // Одобрение публикует маршрут, даже если он был приватным (FR-012a).
+      db.prepare(
+        "UPDATE routes SET sale_status = 'approved', sale_note = NULL, is_public = 1, sale_decided_at = ?, sale_decided_by = ? WHERE id = ?",
+      ).run(ts, admin.id, id);
+    } else if (body.decision === 'reject') {
+      db.prepare(
+        "UPDATE routes SET sale_status = 'rejected', sale_note = ?, price = NULL, is_public = 0, sale_decided_at = ?, sale_decided_by = ? WHERE id = ?",
+      ).run(note, ts, admin.id, id);
+    } else {
+      db.prepare("UPDATE routes SET sale_status = 'delisted', sale_note = ?, sale_decided_at = ?, sale_decided_by = ? WHERE id = ?").run(
+        note,
+        ts,
+        admin.id,
+        id,
+      );
+    }
+    req.log.info({ admin: admin.id, route: id, decision: body.decision }, 'решение по платному маршруту');
+    const author = db.prepare('SELECT email, name, deleted_at FROM users WHERE id = ?').get(row.owner_id) as any;
+    const mailer = ctx.mailer();
+    if (mailer && author && !author.deleted_at) {
+      const link = `${ctx.status().appUrl}/route/${id}`;
+      await mailer
+        .send(saleDecisionMail(author.email, author.name, row.title, body.decision, note, link))
+        .catch((err) => req.log.error(err, 'не удалось отправить письмо о решении'));
+    }
+    return { route: ctx.fullRoute(ctx.loadRoute(id), admin) };
   });
 
   // ---------- Маршруты ----------

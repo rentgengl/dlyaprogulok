@@ -104,7 +104,15 @@ export interface RoutePoint extends LatLng {
 }
 
 export interface Route extends RouteSummary {
+  /** У закрытого платного маршрута (locked) — пустые points, geometry = null. */
   geometry: [number, number][];
+  /** Обложка превью закрытого маршрута: первое фото точки. */
+  cover?: PlacePhoto | null;
+  /** Автор удалил маршрут, но у покупателя он остаётся. */
+  deletedByAuthor?: boolean;
+  /** Автору и администратору: проверка платного доступа и число покупателей. */
+  sale?: { status: SaleStatus; note: string | null; decidedAt: string | null } | null;
+  buyers?: number;
   myRating: number | null;
   isOwner: boolean;
   /** Автор или администратор: показывать инструменты правки. */

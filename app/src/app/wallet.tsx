@@ -36,38 +36,40 @@ export default function WalletScreen() {
   const [custom, setCustom] = useState('');
   const [buying, setBuying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  /** Платёж, за которым следим: из ссылки возврата или созданный на этом экране. */
-  const [paymentId, setPaymentId] = useState<string | null>(params.payment ?? null);
+  /** Платёж, созданный на этом экране; иначе — из ссылки возврата со страницы оплаты. */
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const [createdFake, setCreatedFake] = useState(false);
+  const paymentId = createdId ?? params.payment ?? null;
+  const fake = createdId ? createdFake : params.fake === '1';
   const [payment, setPayment] = useState<Payment | null>(null);
-  const [fake, setFake] = useState(params.fake === '1');
   const pollStarted = useRef(0);
 
-  const load = useCallback(async () => {
-    try {
-      const [p, w, h] = await Promise.all([api.pricing(), api.wallet(), api.walletHistory()]);
-      setPricing(p);
-      setWallet(w);
-      setItems(h.items);
-      setNext(h.next);
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Не удалось загрузить баллы');
-    }
+  const show = useCallback(([p, w, h]: [Pricing, Wallet, { items: LedgerItem[]; next: number | null }]) => {
+    setPricing(p);
+    setWallet(w);
+    setItems(h.items);
+    setNext(h.next);
   }, []);
+  const fail = useCallback((err: unknown) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить баллы'), []);
+  const fetchAll = () => Promise.all([api.pricing(), api.wallet(), api.walletHistory()]);
+  const load = useCallback(() => fetchAll().then(show, fail), [show, fail]);
 
+  const userId = user?.id;
   useEffect(() => {
-    if (user) load();
-  }, [user?.id, load]);
-
-  useEffect(() => {
-    if (params.payment) {
-      setPaymentId(params.payment);
-      setFake(params.fake === '1');
-    }
-  }, [params.payment, params.fake]);
+    if (!userId) return;
+    let off = false;
+    fetchAll().then(
+      (res) => !off && show(res),
+      (err) => !off && fail(err),
+    );
+    return () => {
+      off = true;
+    };
+  }, [userId, show, fail]);
 
   // Опрос статуса до конечного, не дольше 2 минут; заново — при возвращении в приложение после оплаты.
   useEffect(() => {
-    if (!paymentId || !user) return;
+    if (!paymentId || !userId) return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     pollStarted.current = Date.now();
@@ -105,7 +107,7 @@ export default function WalletScreen() {
       if (timer) clearTimeout(timer);
       sub.remove();
     };
-  }, [paymentId, user?.id, load, refresh]);
+  }, [paymentId, userId, load, refresh]);
 
   if (!ready) return <View style={layout.screen} />;
   if (!user) {
@@ -131,12 +133,13 @@ export default function WalletScreen() {
       const url = p.confirmationUrl ?? '';
       if (url.includes('fake=1')) {
         // Подставной шлюз разработки: оплата имитируется кнопками на этом же экране.
-        setFake(true);
-        setPaymentId(p.id);
+        setCreatedFake(true);
+        setCreatedId(p.id);
       } else if (Platform.OS === 'web') {
         globalThis.location.assign(url);
       } else {
-        setPaymentId(p.id);
+        setCreatedFake(false);
+        setCreatedId(p.id);
         await Linking.openURL(url);
       }
     } catch (err) {

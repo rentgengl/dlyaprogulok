@@ -17,6 +17,13 @@ export function RouteCard({ route, showVisibility }: { route: RouteSummary; show
         <Text style={styles.title} numberOfLines={2}>
           {route.title}
         </Text>
+        {route.price != null ? (
+          <View style={[styles.badge, route.owned && styles.badgePublic]}>
+            <Text style={[styles.badgeText, route.owned && { color: colors.forest }]}>
+              {route.owned ? (showVisibility ? `${route.price} баллов` : 'Куплен') : `${route.price} баллов`}
+            </Text>
+          </View>
+        ) : null}
         {showVisibility ? (
           <View style={[styles.badge, route.isPublic && styles.badgePublic]}>
             <Text style={[styles.badgeText, route.isPublic && { color: colors.forest }]}>

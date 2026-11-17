@@ -222,6 +222,12 @@ export const api = {
     request<RouteResponse & { reused?: boolean; charged?: number }>(`/api/points/${id}/story`, json('POST', opts)),
   deleteMedia: (id: string) => request<RouteResponse>(`/api/media/${id}`, { method: 'DELETE' }),
 
+  // ---------- Платные маршруты ----------
+  /** Цена в баллах — заявка на проверку; null — маршрут снова бесплатный. */
+  setRoutePrice: (id: string, price: number | null) => request<RouteResponse>(`/api/routes/${id}/price`, json('PUT', { price })),
+  purchaseRoute: (id: string, expectedCost: number) =>
+    request<RouteResponse>(`/api/routes/${id}/purchase`, json('POST', { expectedCost })),
+
   // ---------- Баллы ----------
   pricing: () => request<Pricing>('/api/pricing'),
   wallet: () => request<Wallet>('/api/wallet'),

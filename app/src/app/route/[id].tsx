@@ -5,6 +5,7 @@ import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Image, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from 'react-native';
 import { AddPlace, type AddMode } from '@/components/AddPlace';
+import { PaidAccessCard } from '@/components/PaidAccess';
 import { pluralPoints, usePriceConfirm, type PaidAction } from '@/components/PriceConfirm';
 import { endpointsText, EndpointsCard, type Draft, type EndpointTarget } from '@/components/Endpoints';
 import { ExportCard } from '@/components/ExportCard';
@@ -205,6 +206,31 @@ export default function RouteScreen() {
     );
   }
 
+  if (route.locked) {
+    return (
+      <LockedRoute
+        route={route}
+        signedIn={!!user}
+        onBuy={() =>
+          priceConfirm.run({
+            title: `Открыть «${route.title}»`,
+            cost: route.price ?? 0,
+            note: 'Маршрут откроется навсегда. Баллы за открытый маршрут не возвращаются.',
+            perform: async (expectedCost) => {
+              setRoute((await api.purchaseRoute(route.id, expectedCost)).route);
+              setInfo('Маршрут открыт. Приятной прогулки!');
+            },
+          }).catch((err) => setError(message(err)))
+        }
+        error={error}
+        confirmElement={priceConfirm.element}
+      />
+    );
+  }
+
+  const buyers = route.buyers ?? 0;
+  const buyersNote = buyers > 0 ? ` Маршрут открыли ${buyers} чел. — покупатели сохранят доступ.` : '';
+
   const reorder = async (order: { pointIds: string[] } | { auto: true }) => {
     setOrdering(true);
     await run(() => api.reorder(route.id, order));
@@ -297,6 +323,7 @@ export default function RouteScreen() {
 
       {info ? <Banner tone="info" text={info} /> : null}
       {error ? <Banner text={error} /> : null}
+      {route.deletedByAuthor ? <Banner tone="info" text="Автор удалил маршрут, но у вас он остаётся: вы его открыли." /> : null}
 
       {route.canEdit && !route.isOwner ? (
         <Banner tone="info" text={`Чужой маршрут: автор — ${route.ownerName}. Вы правите его как администратор.`} />
@@ -314,7 +341,10 @@ export default function RouteScreen() {
               aria-label="Открытый доступ"
               value={route.isPublic}
               trackColor={{ true: colors.forest }}
-              onValueChange={(isPublic) => run(() => api.updateRoute(route.id, { isPublic }))}
+              onValueChange={async (isPublic) => {
+                if (!isPublic && buyers > 0 && !(await confirm(`Скрыть маршрут из каталога?${buyersNote}`, 'Скрыть'))) return;
+                run(() => api.updateRoute(route.id, { isPublic }));
+              }}
             />
           </View>
           <View style={{ gap: space.xs }}>
@@ -473,13 +503,15 @@ export default function RouteScreen() {
 
       <ExportCard route={route} />
 
+      {route.canEdit ? <PaidAccessCard route={route} onRoute={setRoute} /> : null}
+
       {route.canEdit ? (
         <Button
           title="Удалить маршрут"
           icon="trash-outline"
           variant="danger"
           onPress={async () => {
-            if (!(await confirm(`Удалить маршрут «${route.title}»?`, 'Удалить'))) return;
+            if (!(await confirm(`Удалить маршрут «${route.title}»?${buyersNote}`, 'Удалить'))) return;
             try {
               await api.deleteRoute(route.id);
               router.back();
@@ -503,6 +535,57 @@ export default function RouteScreen() {
       <View style={wide ? { width: 480 } : { flex: 1 }}>{details}</View>
       {priceConfirm.element}
     </View>
+  );
+}
+
+/** Превью закрытого платного маршрута: обложка, факты, цена и покупка (FR-013, FR-014a). */
+function LockedRoute({
+  route,
+  signedIn,
+  onBuy,
+  error,
+  confirmElement,
+}: {
+  route: Route;
+  signedIn: boolean;
+  onBuy: () => void;
+  error: string | null;
+  confirmElement: React.ReactNode;
+}) {
+  return (
+    <ScrollView style={layout.screen} contentContainerStyle={layout.content}>
+      <Stack.Screen options={{ title: 'Маршрут' }} />
+      {route.cover ? <CommonsPhoto photo={route.cover} name={route.title} /> : null}
+      <Text style={layout.h1}>{route.title}</Text>
+      {route.description ? <Text style={layout.body}>{route.description}</Text> : null}
+      <Text style={layout.muted}>
+        {formatDistance(route.distanceM)} · {formatDuration(route.durationMin)} · {pluralStops(route.pointCount)}
+        {route.city ? ` · ${route.city}` : ''} · {route.ownerName}
+      </Text>
+      {route.start.label ? <Text style={layout.muted}>Старт: {route.start.label}</Text> : null}
+      {route.rating.count > 0 ? (
+        <View style={styles.ratingRow}>
+          <Stars value={route.rating.avg ?? 0} />
+          <Text style={layout.muted}>
+            {String(route.rating.avg).replace('.', ',')} · оценок: {route.rating.count}
+          </Text>
+        </View>
+      ) : null}
+      <View style={layout.card}>
+        <View style={styles.ratingRow}>
+          <Ionicons name="lock-closed-outline" size={20} color={colors.forest} />
+          <Text style={[layout.body, { flex: 1 }]}>Точки, рассказы и озвучка откроются после покупки.</Text>
+        </View>
+        {signedIn ? (
+          <Button title={`Открыть за ${pluralPoints(route.price ?? 0)}`} icon="lock-open-outline" onPress={onBuy} />
+        ) : (
+          <Button title="Войти, чтобы открыть" variant="secondary" onPress={() => router.navigate('/profile')} />
+        )}
+        <Text style={layout.muted}>Маршрут открывается навсегда. Баллы за открытый маршрут не возвращаются.</Text>
+      </View>
+      {error ? <Banner text={error} /> : null}
+      {confirmElement}
+    </ScrollView>
   );
 }
 
