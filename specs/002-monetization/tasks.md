@@ -194,25 +194,31 @@ description: "Задачи реализации монетизации (002)"
 
 ### Tests for User Story 5 ⚠️
 
-- [ ] T050 [P] [US5] Тесты в `server/test/admin.test.ts`: сводка за период и `reconciled = true` после серии операций; возврат: больше остатка платежа или больше доступного — 400; успешный возврат (`refund.succeeded` через fake) списывает баллы проводкой `refund`, повторное уведомление ничего не меняет; смена цены в настройках действует на следующие операции, прошлые не пересчитываются; не-администратор получает 403 на все `/api/admin/money/*`
+- [X] T050 [P] [US5] Тесты в `server/test/admin.test.ts`: сводка за период и `reconciled = true` после серии операций; возврат: больше остатка платежа или больше доступного — 400; успешный возврат (`refund.succeeded` через fake) списывает баллы проводкой `refund`, повторное уведомление ничего не меняет; смена цены в настройках действует на следующие операции, прошлые не пересчитываются; не-администратор получает 403 на все `/api/admin/money/*`
 
 ### Implementation for User Story 5
 
-- [ ] T051 [US5] В `server/src/admin.ts` реализовать `GET /api/admin/money/summary?from=&to=` (покупки в рублях, выручка генерации, комиссии продаж и премий, комиссии вывода, выплачено, возвраты, остаток баллов у пользователей, `reconciled` + расхождения из `ledger.reconcile`), `GET /api/admin/money/payments`, `GET /api/admin/money/ledger` (фильтры пользователь/тип/период, постранично)
-- [ ] T052 [US5] Возвраты: `POST /api/admin/money/payments/:id/refund` в `server/src/admin.ts` (заморозка `hold(kind 'refund')`, запись `refunds`, `gateway.createRefund`), обработка `refund.succeeded`/`canceled` в уведомлениях и в фоновой сверке в `server/src/money.ts` (проводка `refund`: `user −N`, `sys:refunds +N`; `payments.refunded_kop += …`)
-- [ ] T053 [US5] Карточка пользователя `GET /api/admin/users/:id` в `server/src/admin.ts`: `wallet`, последние 20 операций, открытая заявка
-- [ ] T054 [P] [US5] Админка `app/src/app/admin/money.tsx` (сводка с выбором периода и признаком сверки, платежи, журнал, возврат по платежу), блок счёта в `app/src/app/admin/users/[id].tsx`, пункт меню, методы в `app/src/lib/adminApi.ts`
+- [X] T051 [US5] В `server/src/admin.ts` реализовать `GET /api/admin/money/summary?from=&to=` (покупки в рублях, выручка генерации, комиссии продаж и премий, комиссии вывода, выплачено, возвраты, остаток баллов у пользователей, `reconciled` + расхождения из `ledger.reconcile`), `GET /api/admin/money/payments`, `GET /api/admin/money/ledger` (фильтры пользователь/тип/период, постранично)
+- [X] T052 [US5] Возвраты: `POST /api/admin/money/payments/:id/refund` в `server/src/admin.ts` (заморозка `hold(kind 'refund')`, запись `refunds`, `gateway.createRefund`), обработка `refund.succeeded`/`canceled` в уведомлениях и в фоновой сверке в `server/src/money.ts` (проводка `refund`: `user −N`, `sys:refunds +N`; `payments.refunded_kop += …`)
+- [X] T053 [US5] Карточка пользователя `GET /api/admin/users/:id` в `server/src/admin.ts`: `wallet`, последние 20 операций, открытая заявка
+- [X] T054 [P] [US5] Админка `app/src/app/admin/money.tsx` (сводка с выбором периода и признаком сверки, платежи, журнал, возврат по платежу), блок счёта в `app/src/app/admin/users/[id].tsx`, пункт меню, методы в `app/src/lib/adminApi.ts`
 
 **Checkpoint**: все истории работают; quickstart 6 проходит
+
+Отклонения при реализации US5:
+- Логика возврата (`refund`, `applyRefundStatus`) — в `server/src/money.ts` рядом с уведомлениями и фоновой сверкой; `POST /api/admin/money/payments/:id/refund` в `admin.ts` проверяет ввод и вызывает её. Причина возврата обязательна.
+- Возврат больше остатка платежа или доступного — 400 (как в задаче), а не 402.
+- Если ЮKassa не ответила при создании возврата, он помечается отменённым, заморозка снимается (ответ 502); повтор безопасен — ключ идемпотентности = id возврата.
+- Оферта подставляет действующие цены и комиссии из `/api/pricing`; текст помечен в коде как черновик для проверки юристом.
 
 ---
 
 ## Phase 8: Polish & Cross-Cutting Concerns
 
-- [ ] T055 [P] Экран оферты `app/src/app/offer.tsx` на `LegalPage` (цены и курс баллов, покупка через ЮKassa, вывод любых баллов по заявке с комиссией, отсутствие возврата за открытые маршруты, проверка платных маршрутов, комиссия с продаж и премий, налоги авторов); ссылки на оферту в `app/src/app/terms.tsx` и на экране «Баллы»; раздел о ЮKassa (какие данные передаются, чеки) в `app/src/app/privacy.tsx` — тексты помечены как требующие проверки юристом
-- [ ] T056 [P] Обновить `README.md`: раздел «Монетизация» — настройки, подключение ЮKassa (тестовый и боевой магазин, адрес уведомлений, проверка IP), сверка в админке, режим `fake` для разработки
-- [ ] T057 [P] Обновить инвентаризацию API в `specs/001-baseline-project/contracts/api-contract.md` ссылкой на `specs/002-monetization/contracts/api.md`
-- [ ] T058 Прогнать все проверки: `npm test`, `npm run typecheck`, `npm --prefix app run lint`; пройти сценарии `specs/002-monetization/quickstart.md` 1–8 с `PAYMENTS_PROVIDER=fake`; проверить SC-006: открытие маршрута и премия при достаточном числе баллов — не больше 3 нажатий
+- [X] T055 [P] Экран оферты `app/src/app/offer.tsx` на `LegalPage` (цены и курс баллов, покупка через ЮKassa, вывод любых баллов по заявке с комиссией, отсутствие возврата за открытые маршруты, проверка платных маршрутов, комиссия с продаж и премий, налоги авторов); ссылки на оферту в `app/src/app/terms.tsx` и на экране «Баллы»; раздел о ЮKassa (какие данные передаются, чеки) в `app/src/app/privacy.tsx` — тексты помечены как требующие проверки юристом
+- [X] T056 [P] Обновить `README.md`: раздел «Монетизация» — настройки, подключение ЮKassa (тестовый и боевой магазин, адрес уведомлений, проверка IP), сверка в админке, режим `fake` для разработки
+- [X] T057 [P] Обновить инвентаризацию API в `specs/001-baseline-project/contracts/api-contract.md` ссылкой на `specs/002-monetization/contracts/api.md`
+- [ ] T058 (частично: `npm test` — 170/170, typecheck и lint — см. отчёт; сценарии quickstart 1–6 покрыты автотестами сервера, ручной проход по приложению с `fake` и SC-006 по живому интерфейсу не выполнены) Прогнать все проверки: `npm test`, `npm run typecheck`, `npm --prefix app run lint`; пройти сценарии `specs/002-monetization/quickstart.md` 1–8 с `PAYMENTS_PROVIDER=fake`; проверить SC-006: открытие маршрута и премия при достаточном числе баллов — не больше 3 нажатий
 - [ ] T059 Проверить на тестовом магазине ЮKassa (нужны shopId и ключ тестового магазина от владельца): оплата тестовой картой, уведомление, чек в личном кабинете, возврат
 - [ ] T060 Выкладка (после согласия владельца): внеочередная копия базы `systemctl start rasskazhi-backup.service`, `scripts/deploy.sh`, ключи боевого магазина в админке, адрес уведомлений в личном кабинете ЮKassa; до этого `PAYMENTS_PROVIDER` на сервере пуст
 

@@ -1,13 +1,13 @@
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useState } from 'react';
-import { Text, View } from 'react-native';
+import { Pressable, Text, View } from 'react-native';
 import { AdminPage, adminStyles, Badge, formatDateTime, Toggle } from '@/components/admin';
 import { Banner, Button, Chip, Field, layout } from '@/components/ui';
-import { adminApi, type AdminUser, type UserPatch } from '@/lib/adminApi';
+import { adminApi, LEDGER_KIND, type AdminLedgerEntry, type AdminUser, type AdminWallet, type UserPatch } from '@/lib/adminApi';
 import { useAuth } from '@/lib/auth';
 import { confirm } from '@/lib/confirm';
 import { formatDistance, formatMoscowDate, pluralStops } from '@/lib/format';
-import type { RouteSummary } from '@/lib/types';
+import type { PayoutRequest, RouteSummary } from '@/lib/types';
 import { space } from '@/lib/theme';
 
 type LimitMode = 'default' | 'custom' | 'none';
@@ -30,6 +30,7 @@ export default function AdminUserScreen() {
   const [limitMode, setLimitMode] = useState<LimitMode>('default');
   const [limit, setLimit] = useState('');
   const [password, setPassword] = useState('');
+  const [money, setMoney] = useState<{ wallet: AdminWallet; ledger: AdminLedgerEntry[]; payout: PayoutRequest | null } | null>(null);
 
   const fill = (u: AdminUser) => {
     setUser(u);
@@ -48,6 +49,7 @@ export default function AdminUserScreen() {
       const res = await adminApi.user(id);
       fill(res.user);
       setRoutes(res.routes);
+      setMoney({ wallet: res.wallet, ledger: res.ledger, payout: res.payout });
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -105,6 +107,36 @@ export default function AdminUserScreen() {
       </Text>
       {error ? <Banner text={error} /> : null}
       {notice ? <Banner text={notice} tone="info" /> : null}
+
+      {money ? (
+        <View style={layout.card}>
+          <Text style={layout.h2}>Счёт</Text>
+          <Text style={layout.body}>
+            Остаток {money.wallet.balance} · доступно {money.wallet.available}
+            {money.wallet.frozen ? ` · заморожено ${money.wallet.frozen}` : ''}
+            {money.wallet.reserved ? ` · в резерве ${money.wallet.reserved}` : ''}
+          </Text>
+          {money.payout ? (
+            <Pressable onPress={() => router.push('/admin/payouts')}>
+              <Text style={adminStyles.link}>
+                Открытая заявка на вывод: {money.payout.points} баллов, к выплате {money.payout.payoutRub} ₽
+              </Text>
+            </Pressable>
+          ) : null}
+          {money.ledger.map((e) => (
+            <Text key={e.id} style={adminStyles.rowMeta}>
+              {formatDateTime(e.createdAt)} · {LEDGER_KIND[e.kind] ?? e.kind} · {e.amount > 0 ? '+' : ''}
+              {e.amount}
+              {typeof e.meta?.routeTitle === 'string' ? ` · ${e.meta.routeTitle}` : ''}
+              {typeof e.meta?.message === 'string' ? ` · «${e.meta.message}»` : ''}
+            </Text>
+          ))}
+          {money.ledger.length === 0 ? <Text style={adminStyles.rowMeta}>Операций нет.</Text> : null}
+          <Pressable onPress={() => router.push({ pathname: '/admin/money', params: { user: user.id } })}>
+            <Text style={adminStyles.link}>Платежи и журнал пользователя</Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       <View style={layout.card}>
         <Text style={layout.h2}>Профиль</Text>

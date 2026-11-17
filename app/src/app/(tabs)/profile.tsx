@@ -227,6 +227,10 @@ function LegalLinks() {
       <Text style={[layout.muted, { textDecorationLine: 'underline' }]} role="link" onPress={() => router.push('/terms')}>
         Условия использования
       </Text>
+      <Text style={layout.muted}>·</Text>
+      <Text style={[layout.muted, { textDecorationLine: 'underline' }]} role="link" onPress={() => router.push('/offer')}>
+        Оферта
+      </Text>
     </View>
   );
 }

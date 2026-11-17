@@ -255,8 +255,8 @@ export default function WalletScreen() {
           />
           <Text style={layout.muted}>
             Оплата через ЮKassa, чек придёт на почту. Покупая баллы, вы принимаете{' '}
-            <Text style={styles.link} onPress={() => router.push('/terms')}>
-              условия сервиса
+            <Text style={styles.link} onPress={() => router.push('/offer')}>
+              оферту
             </Text>
             .
           </Text>

@@ -9,9 +9,17 @@ import { z } from 'zod';
 import type { User } from './app.ts';
 import { tx } from './db.ts';
 import { HttpError } from './errors.ts';
-import { available, balanceOf, heldOf, hold, post, release, spend, userAccount } from './ledger.ts';
+import { available, balanceOf, capture, getHold, heldOf, hold, post, release, spend, userAccount } from './ledger.ts';
 import type { Mailer } from './mail.ts';
-import { createGateway, isYookassaIp, type FakeGateway, type PaymentGateway, type ProviderPayment } from './payments.ts';
+import {
+  createGateway,
+  GatewayError,
+  isYookassaIp,
+  type FakeGateway,
+  type PaymentGateway,
+  type ProviderPayment,
+  type ProviderRefund,
+} from './payments.ts';
 import { payoutQuote, splitShare, type Pricing } from './pricing.ts';
 import type { PaymentsConfig } from './settings.ts';
 
@@ -87,7 +95,13 @@ const parseMeta = (raw: string | null): Record<string, any> => {
   }
 };
 
-export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
+/** Что модуль денег отдаёт админке. */
+export interface MoneyAdmin {
+  /** Возврат с платежа через ЮKassa (FR-028); бросает HttpError 400, если сумма больше остатка платежа или доступного. */
+  refund(input: { paymentId: string; points: number; note: string; adminId: string }, log: FastifyBaseLogger): Promise<any>;
+}
+
+export function registerMoney(app: FastifyInstance, ctx: MoneyContext): MoneyAdmin {
   const { db } = ctx;
 
   // Шлюз пересоздаётся, когда в админке меняются настройки платежей.
@@ -242,6 +256,12 @@ export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
     try {
       const body = (req.body ?? {}) as { event?: string; object?: { id?: string } };
       const providerId = typeof body.object?.id === 'string' ? body.object.id : null;
+      if (providerId && body.event?.startsWith('refund.')) {
+        const refund = db.prepare('SELECT * FROM refunds WHERE provider_id = ?').get(providerId) as any;
+        const gw = gateway();
+        if (refund && gw) applyRefundStatus(refund.id, await gw.getRefund(providerId), req.log);
+        return reply.status(200).send({ ok: true });
+      }
       if (!providerId || !body.event?.startsWith('payment.')) return reply.status(200).send({ ok: true });
       const row = db.prepare('SELECT * FROM payments WHERE provider_id = ?').get(providerId) as any;
       if (!row) {
@@ -497,6 +517,97 @@ export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
     return { payout: serializePayout(db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id)) };
   });
 
+  // ---------- Возвраты ----------
+
+  /**
+   * Статус возврата из API ЮKassa. Списание идемпотентно: pending → succeeded один раз, в одной
+   * транзакции с проводкой «пользователь → sys:refunds» из заморозки и увеличением refunded_kop.
+   */
+  function applyRefundStatus(refundId: string, pr: ProviderRefund, log: FastifyBaseLogger) {
+    const row = db.prepare('SELECT * FROM refunds WHERE id = ?').get(refundId) as any;
+    if (!row || row.status !== 'pending') return;
+    const ts = nowIso();
+    if (pr.status === 'succeeded') {
+      tx(db, () => {
+        const r = db.prepare("UPDATE refunds SET status = 'succeeded', updated_at = ? WHERE id = ? AND status = 'pending'").run(ts, row.id);
+        if (!Number(r.changes)) return;
+        const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(row.payment_id) as any;
+        const h = row.hold_id ? getHold(db, row.hold_id) : undefined;
+        const input = {
+          kind: 'refund' as const,
+          actorId: row.admin_id,
+          refType: 'refund',
+          refId: row.id,
+          meta: { paymentId: row.payment_id, note: row.note },
+          entries: [
+            { account: userAccount(payment.user_id), amount: -row.points },
+            { account: 'sys:refunds' as const, amount: row.points },
+          ],
+        };
+        const txId = h?.status === 'active' ? capture(db, h.id, row.points, input, { close: true }) : post(db, input);
+        db.prepare('UPDATE refunds SET ledger_tx_id = ? WHERE id = ?').run(txId, row.id);
+        db.prepare('UPDATE payments SET refunded_kop = refunded_kop + ?, updated_at = ? WHERE id = ?').run(row.points * 100, ts, row.payment_id);
+      });
+      log.info({ refund: row.id, points: row.points }, 'возврат выполнен');
+      return;
+    }
+    if (pr.status === 'canceled') {
+      tx(db, () => {
+        db.prepare("UPDATE refunds SET status = 'canceled', updated_at = ? WHERE id = ? AND status = 'pending'").run(ts, row.id);
+        if (row.hold_id) release(db, row.hold_id);
+      });
+      log.warn({ refund: row.id }, 'ЮKassa отменила возврат');
+    }
+  }
+
+  async function refund(input: { paymentId: string; points: number; note: string; adminId: string }, log: FastifyBaseLogger) {
+    const gw = gateway();
+    if (!gw) throw new HttpError(503, 'Платежи не подключены', 'PAYMENTS_DISABLED');
+    const payment = db.prepare('SELECT p.*, u.email FROM payments p JOIN users u ON u.id = p.user_id WHERE p.id = ?').get(input.paymentId) as any;
+    if (!payment) throw new HttpError(404, 'Платёж не найден');
+    if (payment.status !== 'succeeded' || !payment.provider_id) throw new HttpError(409, 'Вернуть можно только успешный платёж');
+    const id = randomUUID();
+    tx(db, () => {
+      // Остаток платежа: сумма минус выполненные и идущие возвраты.
+      const pending = (
+        db.prepare("SELECT COALESCE(SUM(points), 0) AS s FROM refunds WHERE payment_id = ? AND status = 'pending'").get(payment.id) as { s: number }
+      ).s;
+      const left = payment.points - payment.refunded_kop / 100 - pending;
+      if (input.points > left) throw new HttpError(400, `По этому платежу можно вернуть не больше ${left} баллов`);
+      const avail = available(db, payment.user_id);
+      if (input.points > avail) {
+        throw new HttpError(400, `У пользователя доступно ${avail} баллов: вернуть больше нельзя`, 'INSUFFICIENT_POINTS', {
+          need: input.points,
+          available: avail,
+        });
+      }
+      const h = hold(db, { userId: payment.user_id, kind: 'refund', amount: input.points, refType: 'refund', refId: id });
+      const ts = nowIso();
+      db.prepare(
+        `INSERT INTO refunds (id, payment_id, points, status, admin_id, note, hold_id, created_at, updated_at)
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+      ).run(id, payment.id, input.points, input.adminId, input.note, h.id, ts, ts);
+    });
+    let pr: ProviderRefund;
+    try {
+      pr = await gw.createRefund({
+        id,
+        providerPaymentId: payment.provider_id,
+        amountKop: input.points * 100,
+        description: `Возврат за баллы сервиса «Для прогулок», ${input.points} шт.`,
+        email: payment.email,
+        receipt: ctx.payments().receipt,
+      });
+    } catch (err) {
+      log.error(err, 'не удалось создать возврат');
+      applyRefundStatus(id, { providerId: '', status: 'canceled' }, log);
+      throw new HttpError(502, err instanceof GatewayError ? err.message : 'Не удалось создать возврат');
+    }
+    db.prepare('UPDATE refunds SET provider_id = ?, updated_at = ? WHERE id = ?').run(pr.providerId, nowIso(), id);
+    applyRefundStatus(id, pr, log);
+    return db.prepare('SELECT * FROM refunds WHERE id = ?').get(id);
+  }
+
   // ---------- Фоновая сверка ----------
 
   /**
@@ -516,6 +627,17 @@ export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
     db.prepare(
       "UPDATE payments SET status = 'canceled', cancel_reason = 'not_created', updated_at = ? WHERE status = 'created' AND created_at < ?",
     ).run(nowIso(), new Date(Date.now() - 60 * 60_000).toISOString());
+    // Возвраты, по которым не пришло уведомление.
+    const gw = gateway();
+    if (gw) {
+      for (const r of db.prepare("SELECT * FROM refunds WHERE status = 'pending' AND provider_id IS NOT NULL").all() as any[]) {
+        try {
+          applyRefundStatus(r.id, await gw.getRefund(r.provider_id), log);
+        } catch (err) {
+          log.warn(err, 'сверка возврата не удалась');
+        }
+      }
+    }
     sweepHolds(db);
   }
 
@@ -616,6 +738,8 @@ export function registerMoney(app: FastifyInstance, ctx: MoneyContext) {
     });
     return { items, next: rows.length > q.limit ? items[items.length - 1]!.id : null };
   });
+
+  return { refund };
 }
 
 /**

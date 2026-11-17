@@ -2259,7 +2259,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return { route: fullRoute(loadRouteRow(route.id), user) };
   });
 
-  registerMoney(app, moneyCtx);
+  const money = registerMoney(app, moneyCtx);
 
   registerAdmin(app, {
     db,
@@ -2283,6 +2283,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     fullRoute,
     loadRoute: loadRouteRow,
     removeAccount,
+    money,
   });
 
   return app;
