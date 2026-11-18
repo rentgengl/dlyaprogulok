@@ -1,5 +1,74 @@
 import { adminRequest } from './api';
-import type { Quota, RouteSummary, StoryStyle } from './types';
+import type { LedgerKind, PayoutRequest, Quota, Route, RouteSummary, SaleStatus, StoryStyle } from './types';
+
+/** Подписи видов операций в админке. */
+export const LEDGER_KIND: Record<string, string> = {
+  topup: 'покупка баллов',
+  charge: 'генерация',
+  route_purchase: 'открытие маршрута',
+  tip: 'премия',
+  payout: 'вывод',
+  refund: 'возврат',
+};
+
+export interface AdminWallet {
+  balance: number;
+  available: number;
+  frozen: number;
+  reserved: number;
+}
+
+export interface AdminLedgerEntry {
+  id: number;
+  kind: LedgerKind;
+  amount: number;
+  createdAt: string;
+  meta: Record<string, unknown> | null;
+}
+
+export interface MoneySummary {
+  from: string;
+  to: string;
+  purchasesRub: number;
+  generationRevenue: number;
+  saleCommission: number;
+  tipCommission: number;
+  payoutPoints: number;
+  paidOutRub: number;
+  payoutFeesRub: number;
+  refundsRub: number;
+  pointsOnAccounts: number;
+  reconciled: boolean;
+  problems: string[];
+}
+
+export interface AdminPayment {
+  id: string;
+  user: { id: string; email: string; name: string };
+  points: number;
+  amountRub: number;
+  refundedRub: number;
+  status: string;
+  providerId: string | null;
+  cancelReason: string | null;
+  createdAt: string;
+}
+
+export interface AdminLedgerTx {
+  id: string;
+  kind: LedgerKind;
+  createdAt: string;
+  actorId: string | null;
+  ref: { type: string; id: string } | null;
+  meta: Record<string, unknown> | null;
+  entries: { account: string; amount: number }[];
+}
+
+/** Заявка на вывод с данными для решения. */
+export type AdminPayout = PayoutRequest & {
+  user: { id: string; email: string; name: string; blocked: boolean; balance: number; income: number };
+  recent: { kind: LedgerKind; amount: number; createdAt: string }[];
+};
 
 export interface AdminStats {
   users: { total: number; verified: number; blocked: number; admins: number; newThisMonth: number };
@@ -79,12 +148,33 @@ export const adminApi = {
 
   users: (p: { q?: string; filter?: string; offset?: number; limit?: number }) =>
     adminRequest<{ total: number; users: AdminUser[] }>(`/api/admin/users?${qs(p)}`),
-  user: (id: string) => adminRequest<{ user: AdminUser; routes: RouteSummary[] }>(`/api/admin/users/${id}`),
+  user: (id: string) =>
+    adminRequest<{ user: AdminUser; routes: RouteSummary[]; wallet: AdminWallet; ledger: AdminLedgerEntry[]; payout: PayoutRequest | null }>(
+      `/api/admin/users/${id}`,
+    ),
   updateUser: (id: string, patch: UserPatch) => adminRequest<{ user: AdminUser }>(`/api/admin/users/${id}`, body('PATCH', patch)),
   resetQuota: (id: string) => adminRequest<{ user: AdminUser }>(`/api/admin/users/${id}/quota-reset`, { method: 'POST' }),
   logoutUser: (id: string) => adminRequest<{ closed: number }>(`/api/admin/users/${id}/logout`, { method: 'POST' }),
   deleteUser: (id: string) => adminRequest<void>(`/api/admin/users/${id}`, { method: 'DELETE' }),
 
+  moneySummary: (p: { from?: string; to?: string } = {}) => adminRequest<MoneySummary>(`/api/admin/money/summary?${qs(p)}`),
+  moneyPayments: (p: { user?: string; status?: string; offset?: number; limit?: number } = {}) =>
+    adminRequest<{ total: number; payments: AdminPayment[] }>(`/api/admin/money/payments?${qs(p)}`),
+  moneyLedger: (p: { user?: string; kind?: string; offset?: number; limit?: number } = {}) =>
+    adminRequest<{ total: number; items: AdminLedgerTx[] }>(`/api/admin/money/ledger?${qs(p)}`),
+  refund: (paymentId: string, points: number, note: string) =>
+    adminRequest<{ refund: { id: string; status: string; points: number } }>(
+      `/api/admin/money/payments/${paymentId}/refund`,
+      body('POST', { points, note }),
+    ),
+  payouts: (status: 'open' | 'paid' | 'rejected' | 'all' = 'open') =>
+    adminRequest<{ payouts: AdminPayout[] }>(`/api/admin/payouts?status=${status}`),
+  payoutDecision: (id: string, decision: 'paid' | 'rejected', note: string) =>
+    adminRequest<{ payout: PayoutRequest }>(`/api/admin/payouts/${id}/decision`, body('POST', { decision, note })),
+  /** Очередь проверки платных маршрутов: с полным содержимым. */
+  paidRoutes: (status: SaleStatus = 'pending') => adminRequest<{ routes: Route[] }>(`/api/admin/paid-routes?status=${status}`),
+  saleDecision: (id: string, decision: 'approve' | 'reject' | 'delist', note?: string) =>
+    adminRequest<{ route: Route }>(`/api/admin/paid-routes/${id}/decision`, body('POST', { decision, note })),
   routes: (p: { q?: string; owner?: string; visibility?: string; sort?: string; offset?: number; limit?: number }) =>
     adminRequest<{ total: number; routes: AdminRoute[] }>(`/api/admin/routes?${qs(p)}`),
   updateRoute: (

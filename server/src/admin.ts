@@ -10,7 +10,9 @@ import { z } from 'zod';
 import type { User } from './app.ts';
 import { tx } from './db.ts';
 import { HttpError } from './errors.ts';
-import type { Mailer } from './mail.ts';
+import { available, balanceOf, capture, heldOf, reconcile, release, userAccount } from './ledger.ts';
+import type { MoneyAdmin } from './money.ts';
+import { payoutDecisionMail, saleDecisionMail, type Mailer } from './mail.ts';
 import {
   effectiveEnv,
   isEditable,
@@ -40,6 +42,13 @@ export interface AdminContext {
     appUrl: string;
   };
   mailer: () => Mailer | null;
+  /** Полный маршрут для администратора (с содержимым платного). */
+  fullRoute: (row: any, viewer: User) => unknown;
+  loadRoute: (id: string) => any;
+  /** Удаление или обезличивание аккаунта (research R11). */
+  removeAccount: (userId: string) => Promise<'deleted' | 'anonymized'>;
+  /** Возвраты через ЮKassa. */
+  money: MoneyAdmin;
 }
 
 const now = () => new Date().toISOString();
@@ -165,7 +174,28 @@ export function registerAdmin(app: FastifyInstance, ctx: AdminContext) {
     const routes = db
       .prepare(`SELECT ${ctx.routeColumns} FROM routes r JOIN users u ON u.id = r.owner_id WHERE r.owner_id = ? ORDER BY r.created_at DESC`)
       .all(id) as any[];
-    return { user: { ...userRow(u, u.used), quota: ctx.quotaOf(id) }, routes: routes.map(ctx.summary) };
+    // Счёт: остаток, резервы, 20 последних операций и открытая заявка на вывод.
+    const ledger = (
+      db
+        .prepare(
+          `SELECT e.id, e.amount, e.created_at, t.kind, t.meta FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+           WHERE e.account = ? ORDER BY e.id DESC LIMIT 20`,
+        )
+        .all(userAccount(id)) as any[]
+    ).map((e) => ({ id: e.id, kind: e.kind, amount: e.amount, createdAt: e.created_at, meta: e.meta ? JSON.parse(e.meta) : null }));
+    const payout = db.prepare("SELECT * FROM payout_requests WHERE user_id = ? AND status = 'open'").get(id) as any;
+    return {
+      user: { ...userRow(u, u.used), quota: ctx.quotaOf(id) },
+      routes: routes.map(ctx.summary),
+      wallet: {
+        balance: balanceOf(db, id),
+        available: available(db, id),
+        frozen: heldOf(db, id, 'payout') + heldOf(db, id, 'refund'),
+        reserved: heldOf(db, id, 'charge'),
+      },
+      ledger,
+      payout: payout ? serializePayout(payout) : null,
+    };
   });
 
   app.patch('/api/admin/users/:id', async (req) => {
@@ -242,15 +272,307 @@ export function registerAdmin(app: FastifyInstance, ctx: AdminContext) {
     const { id } = paramsId.parse(req.params);
     if (id === me.id) throw new HttpError(409, 'Нельзя удалить свой аккаунт из админки');
     loadUser(id);
-    const files = db
-      .prepare(
-        `SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id JOIN routes r ON r.id = p.route_id WHERE r.owner_id = ?`,
-      )
-      .all(id) as any[];
-    db.prepare('DELETE FROM users WHERE id = ?').run(id);
-    await ctx.removeFiles(files.map((f) => f.file_name));
-    req.log.info({ admin: me.id, user: id }, 'админ удалил пользователя');
+    // Проданные маршруты остаются у покупателей: такой аккаунт обезличивается.
+    const result = await ctx.removeAccount(id);
+    req.log.info({ admin: me.id, user: id, result }, 'админ удалил пользователя');
     return reply.status(204).send();
+  });
+
+  // ---------- Платные маршруты: проверка ----------
+
+  app.get('/api/admin/paid-routes', async (req) => {
+    const admin = requireAdmin(req);
+    const { status } = z
+      .object({ status: z.enum(['pending', 'approved', 'rejected', 'delisted']).default('pending') })
+      .parse(req.query);
+    const rows = db
+      .prepare(
+        `SELECT ${ctx.routeColumns} FROM routes r JOIN users u ON u.id = r.owner_id
+         WHERE r.sale_status = ? AND r.deleted_at IS NULL ORDER BY r.updated_at ${status === 'pending' ? 'ASC' : 'DESC'} LIMIT 200`,
+      )
+      .all(status) as any[];
+    return { routes: rows.map((r) => ctx.fullRoute(r, admin)) };
+  });
+
+  app.post('/api/admin/paid-routes/:id/decision', async (req) => {
+    const admin = requireAdmin(req);
+    const { id } = paramsId.parse(req.params);
+    const body = z
+      .object({ decision: z.enum(['approve', 'reject', 'delist']), note: z.string().trim().max(1000).optional() })
+      .refine((b) => b.decision === 'approve' || !!b.note, { message: 'Укажите причину' })
+      .parse(req.body);
+    const row = ctx.loadRoute(id);
+    if (!row || row.deleted_at || !row.sale_status) throw new HttpError(404, 'Заявка не найдена');
+    const allowed = { approve: ['pending', 'delisted'], reject: ['pending'], delist: ['approved'] }[body.decision];
+    if (!allowed.includes(row.sale_status)) throw new HttpError(409, 'Это решение для маршрута в таком статусе недоступно');
+    const ts = now();
+    const note = body.note || null;
+    if (body.decision === 'approve') {
+      // Одобрение публикует маршрут, даже если он был приватным (FR-012a).
+      db.prepare(
+        "UPDATE routes SET sale_status = 'approved', sale_note = NULL, is_public = 1, sale_decided_at = ?, sale_decided_by = ? WHERE id = ?",
+      ).run(ts, admin.id, id);
+    } else if (body.decision === 'reject') {
+      db.prepare(
+        "UPDATE routes SET sale_status = 'rejected', sale_note = ?, price = NULL, is_public = 0, sale_decided_at = ?, sale_decided_by = ? WHERE id = ?",
+      ).run(note, ts, admin.id, id);
+    } else {
+      db.prepare("UPDATE routes SET sale_status = 'delisted', sale_note = ?, sale_decided_at = ?, sale_decided_by = ? WHERE id = ?").run(
+        note,
+        ts,
+        admin.id,
+        id,
+      );
+    }
+    req.log.info({ admin: admin.id, route: id, decision: body.decision }, 'решение по платному маршруту');
+    const author = db.prepare('SELECT email, name, deleted_at FROM users WHERE id = ?').get(row.owner_id) as any;
+    const mailer = ctx.mailer();
+    if (mailer && author && !author.deleted_at) {
+      const link = `${ctx.status().appUrl}/route/${id}`;
+      await mailer
+        .send(saleDecisionMail(author.email, author.name, row.title, body.decision, note, link))
+        .catch((err) => req.log.error(err, 'не удалось отправить письмо о решении'));
+    }
+    return { route: ctx.fullRoute(ctx.loadRoute(id), admin) };
+  });
+
+  // ---------- Деньги: сводка, платежи, журнал, возвраты ----------
+
+  /** Период отчёта: from/to — даты или моменты ISO; по умолчанию текущий месяц по Москве. */
+  const period = (q: { from?: string; to?: string }) => {
+    const month = ctx.monthWindow(Date.now());
+    const parse = (v: string | undefined, fallback: Date) => {
+      if (!v) return fallback.toISOString();
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) throw new HttpError(400, 'Неверная дата периода');
+      return d.toISOString();
+    };
+    return { from: parse(q.from, month.start), to: parse(q.to, month.end) };
+  };
+  const periodQuery = { from: z.string().max(40).optional(), to: z.string().max(40).optional() };
+
+  app.get('/api/admin/money/summary', async (req) => {
+    const p = period(z.object(periodQuery).parse(req.query));
+    /** Сумма проводок счёта за период, при желании — только операций одного вида. */
+    const sum = (account: string, kind?: string) =>
+      (
+        db
+          .prepare(
+            `SELECT COALESCE(SUM(e.amount), 0) AS s FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+             WHERE e.account = ? ${kind ? 'AND t.kind = ?' : ''} AND e.created_at >= ? AND e.created_at < ?`,
+          )
+          .get(...[account, ...(kind ? [kind] : []), p.from, p.to]) as { s: number }
+      ).s;
+    const payouts = db
+      .prepare(
+        `SELECT COALESCE(SUM(points), 0) AS points, COALESCE(SUM(payout_kop), 0) AS kop FROM payout_requests
+         WHERE status = 'paid' AND decided_at >= ? AND decided_at < ?`,
+      )
+      .get(p.from, p.to) as { points: number; kop: number };
+    const problems = reconcile(db);
+    return {
+      from: p.from,
+      to: p.to,
+      // 1 балл = 1 ₽: покупки баллов в рублях равны начисленным баллам.
+      purchasesRub: -sum('sys:yookassa'),
+      generationRevenue: sum('sys:revenue', 'charge'),
+      saleCommission: sum('sys:revenue', 'route_purchase'),
+      tipCommission: sum('sys:revenue', 'tip'),
+      payoutPoints: payouts.points,
+      paidOutRub: payouts.kop / 100,
+      payoutFeesRub: (payouts.points * 100 - payouts.kop) / 100,
+      refundsRub: sum('sys:refunds'),
+      pointsOnAccounts: (db.prepare('SELECT COALESCE(SUM(balance), 0) AS s FROM wallets').get() as { s: number }).s,
+      reconciled: problems.length === 0,
+      problems,
+    };
+  });
+
+  app.get('/api/admin/money/payments', async (req) => {
+    const q = z
+      .object({
+        ...periodQuery,
+        ...page,
+        user: z.string().uuid().optional(),
+        status: z.enum(['created', 'pending', 'succeeded', 'canceled', 'mismatch']).optional(),
+      })
+      .parse(req.query);
+    const where = ['1 = 1'];
+    const args: (string | number)[] = [];
+    if (q.user) where.push('p.user_id = ?'), args.push(q.user);
+    if (q.status) where.push('p.status = ?'), args.push(q.status);
+    if (q.from) where.push('p.created_at >= ?'), args.push(period(q).from);
+    if (q.to) where.push('p.created_at < ?'), args.push(period(q).to);
+    const rows = db
+      .prepare(
+        `SELECT p.*, u.email, u.name FROM payments p JOIN users u ON u.id = p.user_id WHERE ${where.join(' AND ')}
+         ORDER BY p.created_at DESC LIMIT ? OFFSET ?`,
+      )
+      .all(...args, q.limit, q.offset) as any[];
+    const total = (db.prepare(`SELECT COUNT(*) AS n FROM payments p WHERE ${where.join(' AND ')}`).get(...args) as { n: number }).n;
+    return {
+      total,
+      payments: rows.map((r) => ({
+        id: r.id,
+        user: { id: r.user_id, email: r.email, name: r.name },
+        points: r.points,
+        amountRub: r.amount_kop / 100,
+        refundedRub: r.refunded_kop / 100,
+        status: r.status,
+        providerId: r.provider_id,
+        cancelReason: r.cancel_reason,
+        createdAt: r.created_at,
+      })),
+    };
+  });
+
+  app.get('/api/admin/money/ledger', async (req) => {
+    const q = z
+      .object({
+        ...periodQuery,
+        ...page,
+        user: z.string().uuid().optional(),
+        kind: z.enum(['topup', 'charge', 'route_purchase', 'tip', 'payout', 'refund']).optional(),
+      })
+      .parse(req.query);
+    const where = ['1 = 1'];
+    const args: (string | number)[] = [];
+    if (q.user) where.push('EXISTS (SELECT 1 FROM ledger_entries x WHERE x.tx_id = t.id AND x.account = ?)'), args.push(userAccount(q.user));
+    if (q.kind) where.push('t.kind = ?'), args.push(q.kind);
+    if (q.from) where.push('t.created_at >= ?'), args.push(period(q).from);
+    if (q.to) where.push('t.created_at < ?'), args.push(period(q).to);
+    const rows = db
+      .prepare(`SELECT t.* FROM ledger_tx t WHERE ${where.join(' AND ')} ORDER BY t.created_at DESC, t.rowid DESC LIMIT ? OFFSET ?`)
+      .all(...args, q.limit, q.offset) as any[];
+    const total = (db.prepare(`SELECT COUNT(*) AS n FROM ledger_tx t WHERE ${where.join(' AND ')}`).get(...args) as { n: number }).n;
+    const entries = db.prepare('SELECT account, amount FROM ledger_entries WHERE tx_id = ? ORDER BY id');
+    return {
+      total,
+      items: rows.map((t) => ({
+        id: t.id,
+        kind: t.kind,
+        createdAt: t.created_at,
+        actorId: t.actor_id,
+        ref: t.ref_type ? { type: t.ref_type, id: t.ref_id } : null,
+        // Администратор видит и сообщения премий (FR-022).
+        meta: t.meta ? JSON.parse(t.meta) : null,
+        entries: entries.all(t.id),
+      })),
+    };
+  });
+
+  /** Возврат купленных баллов деньгами через ЮKassa (FR-028); начислить баллы вручную нельзя. */
+  app.post('/api/admin/money/payments/:id/refund', async (req, reply) => {
+    const admin = requireAdmin(req);
+    const { id } = paramsId.parse(req.params);
+    const body = z
+      .object({ points: z.number().int().min(1), note: z.string().trim().min(1, 'Укажите причину возврата').max(1000) })
+      .parse(req.body);
+    const r = await ctx.money.refund({ paymentId: id, points: body.points, note: body.note, adminId: admin.id }, req.log);
+    req.log.info({ admin: admin.id, payment: id, refund: r.id, points: body.points }, 'возврат по платежу');
+    return reply.status(201).send({
+      refund: { id: r.id, paymentId: r.payment_id, points: r.points, status: r.status, note: r.note, createdAt: r.created_at },
+    });
+  });
+
+  // ---------- Заявки на вывод ----------
+
+  const serializePayout = (r: any) => ({
+    id: r.id,
+    points: r.points,
+    feePct: r.fee_pct,
+    payoutRub: r.payout_kop / 100,
+    status: r.status,
+    createdAt: r.created_at,
+    note: r.admin_note ?? null,
+    decidedAt: r.decided_at ?? null,
+  });
+
+  /** Заявки с данными для решения: пользователь, остаток, доход и последние операции. */
+  app.get('/api/admin/payouts', async (req) => {
+    requireAdmin(req);
+    const { status } = z.object({ status: z.enum(['open', 'paid', 'rejected', 'all']).default('open') }).parse(req.query);
+    const rows = db
+      .prepare(
+        `SELECT p.*, u.email, u.name, u.blocked_at FROM payout_requests p JOIN users u ON u.id = p.user_id
+         ${status === 'all' ? '' : 'WHERE p.status = ?'} ORDER BY p.created_at ${status === 'open' ? 'ASC' : 'DESC'} LIMIT 200`,
+      )
+      .all(...(status === 'all' ? [] : [status])) as any[];
+    const income = db.prepare(
+      `SELECT COALESCE(SUM(e.amount), 0) AS s FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+       WHERE e.account = ? AND e.amount > 0 AND t.kind IN ('route_purchase', 'tip')`,
+    );
+    const recent = db.prepare(
+      `SELECT e.amount, e.created_at, t.kind FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+       WHERE e.account = ? ORDER BY e.id DESC LIMIT 10`,
+    );
+    const balance = db.prepare('SELECT balance FROM wallets WHERE user_id = ?');
+    return {
+      payouts: rows.map((r) => {
+        const account = userAccount(r.user_id);
+        return {
+          ...serializePayout(r),
+          user: {
+            id: r.user_id,
+            email: r.email,
+            name: r.name,
+            blocked: !!r.blocked_at,
+            balance: (balance.get(r.user_id) as { balance: number } | undefined)?.balance ?? 0,
+            income: (income.get(account) as { s: number }).s,
+          },
+          recent: (recent.all(account) as any[]).map((e) => ({ kind: e.kind, amount: e.amount, createdAt: e.created_at })),
+        };
+      }),
+    };
+  });
+
+  /** «Выплачено» — замороженные баллы списываются окончательно; «отклонено» — заморозка снимается (FR-024b). */
+  app.post('/api/admin/payouts/:id/decision', async (req) => {
+    const admin = requireAdmin(req);
+    const { id } = paramsId.parse(req.params);
+    const body = z
+      .object({ decision: z.enum(['paid', 'rejected']), note: z.string().trim().min(1, 'Добавьте комментарий').max(1000) })
+      .parse(req.body);
+    const row = db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id) as any;
+    if (!row) throw new HttpError(404, 'Заявка не найдена');
+    if (row.status !== 'open') throw new HttpError(409, 'Заявка уже закрыта');
+    const ts = now();
+    tx(db, () => {
+      let txId: string | null = null;
+      if (body.decision === 'paid') {
+        txId = capture(
+          db,
+          row.hold_id,
+          row.points,
+          {
+            kind: 'payout',
+            actorId: admin.id,
+            refType: 'payout',
+            refId: id,
+            meta: { title: 'Вывод', feePct: row.fee_pct, payoutRub: row.payout_kop / 100 },
+            entries: [
+              { account: userAccount(row.user_id), amount: -row.points },
+              { account: 'sys:payouts', amount: row.points },
+            ],
+          },
+          { close: true },
+        );
+      } else {
+        release(db, row.hold_id);
+      }
+      db.prepare(
+        'UPDATE payout_requests SET status = ?, admin_note = ?, ledger_tx_id = ?, decided_at = ?, decided_by = ? WHERE id = ?',
+      ).run(body.decision, body.note, txId, ts, admin.id, id);
+    });
+    req.log.info({ admin: admin.id, payout: id, decision: body.decision }, 'решение по заявке на вывод');
+    const user = db.prepare('SELECT email, name, deleted_at FROM users WHERE id = ?').get(row.user_id) as any;
+    const mailer = ctx.mailer();
+    if (mailer && user && !user.deleted_at) {
+      await mailer
+        .send(payoutDecisionMail(user.email, user.name, body.decision, row.points, row.payout_kop / 100, body.note, `${ctx.status().appUrl}/wallet`))
+        .catch((err) => req.log.error(err, 'не удалось отправить письмо о выводе'));
+    }
+    return { payout: serializePayout(db.prepare('SELECT * FROM payout_requests WHERE id = ?').get(id)) };
   });
 
   // ---------- Маршруты ----------

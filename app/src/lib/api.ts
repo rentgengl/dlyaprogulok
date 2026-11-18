@@ -9,6 +9,14 @@ import type {
   GeocodeResult,
   Job,
   LatLng,
+  LedgerItem,
+  Payment,
+  PayoutRequest,
+  Pricing,
+  Quote,
+  StoriesQuote,
+  PointStoryQuote,
+  Wallet,
   Quota,
   Route,
   RouteSummary,
@@ -40,11 +48,16 @@ export const setApiToken = (t: string | null) => {
   token = t;
 };
 
+/** Ошибка API. code и body — для платных действий: INSUFFICIENT_POINTS { need, available }, PRICE_CHANGED { cost }. */
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code?: string;
+  body: Record<string, unknown>;
+  constructor(status: number, message: string, code?: string, body: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
+    this.code = code;
+    this.body = body;
   }
 }
 
@@ -63,7 +76,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await send(path, init);
   if (res.status === 204) return undefined as T;
   const data = await res.json().catch(() => null);
-  if (!res.ok) throw new ApiError(res.status, data?.error ?? 'Что-то пошло не так');
+  if (!res.ok) throw new ApiError(res.status, data?.error ?? 'Что-то пошло не так', data?.code, data ?? {});
   return data as T;
 }
 
@@ -90,8 +103,11 @@ export const api = {
   forgotPassword: (email: string) => request<{ sent: true }>('/api/auth/forgot', json('POST', { email })),
   resetPassword: (token: string, password: string) =>
     request<{ token: string; user: User }>('/api/auth/reset', json('POST', { token, password })),
-  deleteAccount: (password: string) => request<void>('/api/me', json('DELETE', { password })),
+  /** force — удалить, даже если на счёте остались баллы (иначе 409 HAS_POINTS). */
+  deleteAccount: (password: string, force = false) => request<void>('/api/me', json('DELETE', { password, force })),
   me: () => request<{ user: User }>('/api/me'),
+  /** Что включено на сервере: ИИ, синтез речи, подтверждение почты. */
+  config: () => request<{ aiEnabled: boolean; ttsEnabled: boolean; emailVerification: boolean }>('/api/config'),
 
   geocode: (q: string, near?: LatLng) => {
     const qs = new URLSearchParams({ q });
@@ -139,12 +155,14 @@ export const api = {
     interests?: string;
     storyStyle?: StoryStyle;
     autoStories: boolean;
+    /** Подтверждённая цена; нужна, если маршрут сверх бесплатного лимита. */
+    expectedCost?: number;
   }) => request<{ job: Job; quota: Quota }>('/api/routes/generate', json('POST', { ...body, background: true })),
   job: (id: string) => request<{ job: Job }>(`/api/jobs/${id}`),
   jobs: () => request<{ jobs: Job[] }>('/api/jobs'),
   /** Рассказы для всех точек в фоне; если задача уже идёт, вернётся она. */
-  routeStories: (id: string, body: { style?: StoryStyle; redo?: boolean }) =>
-    request<{ job: Job }>(`/api/routes/${id}/stories`, json('POST', body)),
+  routeStories: (id: string, body: { style?: StoryStyle; redo?: boolean; expectedCost?: number }) =>
+    request<{ job: Job; cost: number }>(`/api/routes/${id}/stories`, json('POST', body)),
   /** Маршрут вручную: пустой, точки добавляет автор. Месячный лимит не тратит. */
   createRoute: (body: {
     title: string;
@@ -160,6 +178,7 @@ export const api = {
     roundTrip: boolean;
     interests?: string;
     storyStyle?: StoryStyle;
+    expectedCost?: number;
   }) => request<RouteResponse & { quota: Quota }>('/api/routes/generate', json('POST', body)),
   updateRoute: (id: string, patch: { title?: string; description?: string; isPublic?: boolean; storyStyle?: StoryStyle }) =>
     request<RouteResponse>(`/api/routes/${id}`, json('PATCH', patch)),
@@ -201,9 +220,49 @@ export const api = {
     request<RouteResponse>(`/api/points/${id}`, json('PATCH', patch)),
   deletePoint: (id: string) => request<RouteResponse>(`/api/points/${id}`, { method: 'DELETE' }),
   /** fresh — «Создать заново»: новый текст вместо готового рассказа о том же месте из другого маршрута. */
-  generateStory: (id: string, opts: { keepText?: boolean; style?: StoryStyle; fresh?: boolean } = {}) =>
-    request<RouteResponse & { reused?: boolean }>(`/api/points/${id}/story`, json('POST', opts)),
+  generateStory: (id: string, opts: { keepText?: boolean; style?: StoryStyle; fresh?: boolean; expectedCost?: number } = {}) =>
+    request<RouteResponse & { reused?: boolean; charged?: number }>(`/api/points/${id}/story`, json('POST', opts)),
   deleteMedia: (id: string) => request<RouteResponse>(`/api/media/${id}`, { method: 'DELETE' }),
+
+  // ---------- Платные маршруты ----------
+  /** Цена в баллах — заявка на проверку; null — маршрут снова бесплатный. */
+  setRoutePrice: (id: string, price: number | null) => request<RouteResponse>(`/api/routes/${id}/price`, json('PUT', { price })),
+  purchaseRoute: (id: string, expectedCost: number) =>
+    request<RouteResponse>(`/api/routes/${id}/purchase`, json('POST', { expectedCost })),
+
+  // ---------- Премии и вывод ----------
+  sendTip: (body: { authorId: string; routeId?: string; amount: number; message?: string; expectedCost: number }) =>
+    request<{ tip: { id: string; amount: number } }>('/api/tips', json('POST', body)),
+  author: (id: string) => request<{ author: { id: string; name: string }; routes: RouteSummary[] }>(`/api/authors/${id}`),
+  payoutQuote: (points: number) =>
+    request<{ points: number; feePct: number; fee: number; payoutRub: number }>(`/api/payouts/quote?points=${points}`),
+  createPayout: (points: number) => request<{ payout: PayoutRequest }>('/api/payouts', json('POST', { points })),
+  payouts: () => request<{ payouts: PayoutRequest[] }>('/api/payouts'),
+  revokePayout: (id: string) => request<{ payout: PayoutRequest }>(`/api/payouts/${id}`, { method: 'DELETE' }),
+
+  // ---------- Баллы ----------
+  pricing: () => request<Pricing>('/api/pricing'),
+  wallet: () => request<Wallet>('/api/wallet'),
+  walletHistory: (before?: number) =>
+    request<{ items: LedgerItem[]; next: number | null }>(`/api/wallet/history${before ? `?before=${before}` : ''}`),
+  createPayment: (points: number) => request<{ payment: Payment }>('/api/payments', json('POST', { points })),
+  getPayment: (id: string) => request<{ payment: Payment }>(`/api/payments/${id}`),
+  /** Только подставной шлюз разработки: имитация оплаты или отказа покупателя. */
+  fakePay: (id: string, result: 'succeeded' | 'canceled') =>
+    request<{ payment: Payment }>(`/api/dev/fake-payments/${id}`, json('POST', { result })),
+  routeQuote: (p: { durationMin?: number; distanceM?: number; roundTrip: boolean }) => {
+    const qs = new URLSearchParams({ roundTrip: String(p.roundTrip) });
+    if (p.durationMin !== undefined) qs.set('durationMin', String(p.durationMin));
+    if (p.distanceM !== undefined) qs.set('distanceM', String(p.distanceM));
+    return request<Quote & { free: boolean; paymentsEnabled: boolean }>(`/api/routes/quote?${qs}`);
+  },
+  storiesQuote: (routeId: string, p: { style?: StoryStyle; redo?: boolean } = {}) => {
+    const qs = new URLSearchParams({ redo: String(!!p.redo) });
+    if (p.style) qs.set('style', p.style);
+    return request<StoriesQuote>(`/api/routes/${routeId}/stories/quote?${qs}`);
+  },
+  pointStoryQuote: (pointId: string, keepText = false) =>
+    request<PointStoryQuote>(`/api/points/${pointId}/story/quote?keepText=${keepText}`),
 
   uploadMedia: (pointId: string, asset: UploadAsset) => {
     const form = new FormData();

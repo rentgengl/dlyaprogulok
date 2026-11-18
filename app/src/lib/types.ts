@@ -20,6 +20,8 @@ export interface User {
   /** Доступ к админке /admin. */
   isAdmin: boolean;
   quota: Quota;
+  /** Баллы: всего и доступно к трате (без резервов и заморозок). */
+  wallet: { balance: number; available: number };
 }
 
 /** Направление рассказа о месте. */
@@ -32,6 +34,12 @@ export const STORY_STYLE_LABEL: Record<StoryStyle, string> = {
 
 export interface RouteSummary {
   id: string;
+  /** Цена в баллах; null — бесплатный маршрут. */
+  price?: number | null;
+  /** Маршрут открыт этим пользователем или это его маршрут. */
+  owned?: boolean;
+  /** Платный маршрут без доступа: только превью, без точек и карты. */
+  locked?: boolean;
   title: string;
   description: string;
   lang: string;
@@ -96,7 +104,15 @@ export interface RoutePoint extends LatLng {
 }
 
 export interface Route extends RouteSummary {
+  /** У закрытого платного маршрута (locked) — пустые points, geometry = null. */
   geometry: [number, number][];
+  /** Обложка превью закрытого маршрута: первое фото точки. */
+  cover?: PlacePhoto | null;
+  /** Автор удалил маршрут, но у покупателя он остаётся. */
+  deletedByAuthor?: boolean;
+  /** Автору и администратору: проверка платного доступа и число покупателей. */
+  sale?: { status: SaleStatus; note: string | null; decidedAt: string | null } | null;
+  buyers?: number;
   myRating: number | null;
   isOwner: boolean;
   /** Автор или администратор: показывать инструменты правки. */
@@ -161,6 +177,101 @@ export interface Job {
   notices: string[];
   error: string | null;
   params: { request?: { start?: { label?: string } }; autoStories?: boolean };
+  /** free — в бесплатном лимите; paid — за баллы. */
+  billing?: 'free' | 'paid';
+  /** Уже списано баллов по задаче. */
+  charged?: number;
+  /** Ещё зарезервировано: спишется по мере готовности, остаток вернётся. */
+  reserved?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+// ---------- Монетизация ----------
+
+export interface Pricing {
+  route3h: number;
+  story: number;
+  narration2min: number;
+  saleCommissionPct: number;
+  payoutCommissionPct: number;
+  routePrice: { min: number; max: number };
+  tip: { min: number; max: number };
+  topup: { min: number; max: number };
+  payoutMin: number;
+  /** false — платежи не подключены: цен и покупок в приложении нет. */
+  paymentsEnabled: boolean;
+}
+
+export type PayoutStatus = 'open' | 'paid' | 'rejected';
+
+export interface PayoutRequest {
+  id: string;
+  points: number;
+  feePct: number;
+  payoutRub: number;
+  status: PayoutStatus;
+  createdAt: string;
+  note?: string | null;
+  decidedAt?: string | null;
+}
+
+export interface Wallet {
+  balance: number;
+  available: number;
+  /** Заморожено заявкой на вывод или возвратом. */
+  frozen: number;
+  /** Зарезервировано под идущую генерацию. */
+  reserved: number;
+  pendingPayout: PayoutRequest | null;
+  incomeThisMonth: number;
+}
+
+export type LedgerKind = 'topup' | 'charge' | 'route_purchase' | 'tip' | 'payout' | 'refund';
+
+export interface LedgerItem {
+  id: number;
+  kind: LedgerKind;
+  amount: number;
+  createdAt: string;
+  title: string;
+  route: { id: string; title: string } | null;
+  counterparty: { id: string; name: string } | null;
+  commission: number | null;
+  message: string | null;
+}
+
+export type PaymentStatus = 'created' | 'pending' | 'succeeded' | 'canceled' | 'mismatch';
+
+export interface Payment {
+  id: string;
+  status: PaymentStatus;
+  points: number;
+  createdAt: string;
+  confirmationUrl?: string | null;
+  cancelReason?: string | null;
+}
+
+/** Статус проверки платного маршрута. */
+export type SaleStatus = 'pending' | 'approved' | 'rejected' | 'delisted';
+
+/** Цена платного действия до подтверждения; free — входит в бесплатный лимит. */
+export interface Quote {
+  cost: number;
+  free?: boolean;
+  freeLeft?: number | null;
+  limit?: number | null;
+}
+
+export interface StoriesQuote {
+  cost: number;
+  /** Точек, для которых будет что-то сделано. */
+  points: number;
+  items: { pointId: string; story: number; narrationEstimate: number }[];
+}
+
+export interface PointStoryQuote {
+  cost: number;
+  story: number;
+  narrationEstimate: number;
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -12,7 +13,7 @@ import { buildApp } from '../src/app.ts';
 import { openDb } from '../src/db.ts';
 import type { Mail } from '../src/mail.ts';
 import type { GeoServices } from '../src/services.ts';
-import { maskSecret, servicesFromEnv, type Env, type Services } from '../src/settings.ts';
+import { maskSecret, paymentsFromEnv, pricingFromEnv, servicesFromEnv, type Env, type Services } from '../src/settings.ts';
 
 const START = { lat: 55.75, lng: 37.62 };
 
@@ -413,5 +414,143 @@ describe('админка', () => {
     assert.equal(maskSecret('short'), '••••');
     assert.equal(maskSecret('AQVN-very-long-key-9f3a'), '••••9f3a');
     assert.equal(maskSecret('smtps://u%40d.ru:p@ss@mail.d.ru:465'), 'smtps://u%40d.ru:••••@mail.d.ru:465');
+  });
+});
+
+describe('админка: деньги (US5)', () => {
+  let app: FastifyInstance;
+  let dir: string;
+  let db: import('node:sqlite').DatabaseSync;
+  let n = 0;
+  const env: Env = { PAYMENTS_PROVIDER: 'fake' };
+
+  before(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'rasskazhi-admin-money-'));
+  });
+  after(async () => {
+    await app?.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  beforeEach(async () => {
+    await app?.close();
+    const sub = mkdtempSync(path.join(dir, 't-'));
+    db = openDb(path.join(sub, 'db.sqlite'));
+    app = await buildApp({
+      db,
+      geo,
+      ai: null,
+      tts: null,
+      uploadsDir: path.join(sub, 'uploads'),
+      adminEmails: ['boss@example.com'],
+      baseEnv: env,
+      reconfigure: (e) => servicesFromEnv({ ...e, ANTHROPIC_API_KEY: '', DEEPSEEK_API_KEY: '' }),
+      pricing: pricingFromEnv(env),
+      payments: paymentsFromEnv(env),
+    });
+  });
+
+  const call = async (method: string, url: string, token?: string, body?: unknown, remoteAddress?: string) => {
+    const res = await app.inject({
+      method: method as 'GET',
+      url,
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      ...(body !== undefined ? { payload: body as object } : {}),
+      ...(remoteAddress ? { remoteAddress } : {}),
+    });
+    return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null };
+  };
+  const register = async (email = `m${++n}@example.com`) => {
+    const res = await call('POST', '/api/auth/register', undefined, { email, password: 'correct horse', name: `Пользователь ${n}` });
+    assert.equal(res.status, 201, JSON.stringify(res.json));
+    return { token: res.json.token as string, id: res.json.user.id as string };
+  };
+  const buy = async (token: string, points: number) => {
+    const created = await call('POST', '/api/payments', token, { points });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    await call('POST', `/api/dev/fake-payments/${created.json.payment.id}`, token, { result: 'succeeded' });
+    return created.json.payment.id as string;
+  };
+
+  test('не-администратор не видит денежные разделы', async () => {
+    const user = await register();
+    for (const url of ['/api/admin/money/summary', '/api/admin/money/payments', '/api/admin/money/ledger']) {
+      assert.equal((await call('GET', url, user.token)).status, 403, url);
+    }
+    assert.equal((await call('POST', `/api/admin/money/payments/${randomUUID()}/refund`, user.token, { points: 1, note: 'x' })).status, 403);
+  });
+
+  test('сводка за период сходится; журнал и платежи с фильтрами; карточка пользователя со счётом', async () => {
+    const admin = await register('boss@example.com');
+    const author = await register();
+    const fan = await register();
+    await buy(fan.token, 500);
+    await buy(author.token, 600);
+    assert.equal((await call('POST', '/api/tips', fan.token, { authorId: author.id, amount: 100, expectedCost: 100 })).status, 201);
+    const payout = (await call('POST', '/api/payouts', author.token, { points: 500 })).json.payout;
+    await call('POST', `/api/admin/payouts/${payout.id}/decision`, admin.token, { decision: 'paid', note: 'Перевод' });
+
+    const s = await call('GET', '/api/admin/money/summary', admin.token);
+    assert.equal(s.status, 200, JSON.stringify(s.json));
+    assert.equal(s.json.reconciled, true, JSON.stringify(s.json.problems));
+    assert.equal(s.json.purchasesRub, 1100);
+    assert.equal(s.json.tipCommission, 20);
+    assert.equal(s.json.paidOutRub, 475);
+    assert.equal(s.json.payoutFeesRub, 25);
+    assert.equal(s.json.pointsOnAccounts, 400 + 680 - 500);
+    const past = await call('GET', '/api/admin/money/summary?from=2020-01-01&to=2020-02-01', admin.token);
+    assert.equal(past.json.purchasesRub, 0);
+
+    const payments = await call('GET', `/api/admin/money/payments?user=${fan.id}`, admin.token);
+    assert.equal(payments.json.payments.length, 1);
+    assert.equal(payments.json.payments[0].points, 500);
+    const ledger = await call('GET', `/api/admin/money/ledger?user=${author.id}&kind=tip`, admin.token);
+    assert.equal(ledger.json.items.length, 1);
+    assert.equal(ledger.json.items[0].kind, 'tip');
+
+    const card = await call('GET', `/api/admin/users/${author.id}`, admin.token);
+    assert.equal(card.json.wallet.balance, 180);
+    assert.ok(card.json.ledger.length >= 3);
+    assert.equal(card.json.payout, null);
+  });
+
+  test('возврат: не больше остатка платежа и доступного; повторное уведомление ничего не меняет', async () => {
+    const admin = await register('boss@example.com');
+    const user = await register();
+    const other = await register();
+    const paymentId = await buy(user.token, 300);
+    await call('POST', '/api/tips', user.token, { authorId: other.id, amount: 200, expectedCost: 200 });
+    const refund = (points: number) => call('POST', `/api/admin/money/payments/${paymentId}/refund`, admin.token, { points, note: 'Просьба пользователя' });
+    assert.equal((await refund(400)).status, 400, 'больше платежа');
+    assert.equal((await refund(150)).status, 400, 'больше доступного');
+    const ok = await refund(100);
+    assert.equal(ok.status, 201, JSON.stringify(ok.json));
+    assert.equal(ok.json.refund.status, 'succeeded');
+    const wallet = async () => (await call('GET', '/api/wallet', user.token)).json;
+    assert.equal((await wallet()).balance, 0);
+    assert.equal((db.prepare('SELECT refunded_kop FROM payments WHERE id = ?').get(paymentId) as any).refunded_kop, 10000);
+
+    const providerId = (db.prepare('SELECT provider_id FROM refunds').get() as any).provider_id;
+    const notify = await call('POST', '/api/payments/yookassa/notify', undefined, { event: 'refund.succeeded', object: { id: providerId } }, '185.71.76.10');
+    assert.equal(notify.status, 200);
+    assert.equal((await wallet()).balance, 0, 'повторно не списано');
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM ledger_tx WHERE kind = 'refund'").get() as any).n, 1);
+    assert.equal((await refund(250)).status, 400, 'остаток платежа — 200');
+    const s = await call('GET', '/api/admin/money/summary', admin.token);
+    assert.equal(s.json.refundsRub, 100);
+    assert.equal(s.json.reconciled, true, JSON.stringify(s.json.problems));
+  });
+
+  test('новая комиссия действует на следующие операции, прошлые не пересчитываются', async () => {
+    const admin = await register('boss@example.com');
+    const author = await register();
+    const fan = await register();
+    await buy(fan.token, 300);
+    await call('POST', '/api/tips', fan.token, { authorId: author.id, amount: 100, expectedCost: 100 });
+    const put = await call('PUT', '/api/admin/settings', admin.token, { values: { SALE_COMMISSION_PCT: '50' } });
+    assert.equal(put.status, 200, JSON.stringify(put.json));
+    await call('POST', '/api/tips', fan.token, { authorId: author.id, amount: 100, expectedCost: 100 });
+    const shares = (db.prepare('SELECT author_share FROM tips ORDER BY created_at').all() as any[]).map((r) => r.author_share);
+    assert.deepEqual(shares, [80, 50]);
+    assert.equal((await call('GET', '/api/wallet', author.token)).json.balance, 130);
   });
 });

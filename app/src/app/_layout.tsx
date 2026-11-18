@@ -34,6 +34,9 @@ export default function RootLayout() {
         <Stack.Screen name="reset" options={{ title: 'Новый пароль', headerBackTitle: 'Назад' }} />
         <Stack.Screen name="privacy" options={{ title: 'Конфиденциальность', headerBackTitle: 'Назад' }} />
         <Stack.Screen name="terms" options={{ title: 'Условия', headerBackTitle: 'Назад' }} />
+        <Stack.Screen name="offer" options={{ title: 'Оферта', headerBackTitle: 'Назад' }} />
+        <Stack.Screen name="wallet" options={{ title: 'Баллы', headerBackTitle: 'Назад' }} />
+        <Stack.Screen name="author/[id]" options={{ title: 'Автор', headerBackTitle: 'Назад' }} />
       </Stack>
       </CityProvider>
     </AuthProvider>

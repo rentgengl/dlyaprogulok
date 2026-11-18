@@ -24,8 +24,20 @@ import { passwordResetMail, verificationMail, type Mailer } from './mail.ts';
 import { factsSource, factsStory, mergeFacts, type Fact, type PlacePhoto } from './places.ts';
 import { legendSections, normalize, type GeoServices } from './services.ts';
 import { injectShareMeta, routeFacts } from './share.ts';
-import { servicesFromEnv, type Env, type Services } from './settings.ts';
-import type { TTS } from './tts.ts';
+import { available, balanceOf, capture, findHold, hold, release, userAccount } from './ledger.ts';
+import { createMediaSigner, mediaSigningKey, registerMedia } from './media.ts';
+import { checkExpected, registerMoney, requireSpender, walletBrief, type MoneyContext } from './money.ts';
+import {
+  narrationCost,
+  quoteTotal,
+  routeCost,
+  routeMinutes,
+  storyItemQuote,
+  type Pricing,
+  type StoryQuoteItem,
+} from './pricing.ts';
+import { paymentsFromEnv, pricingFromEnv, servicesFromEnv, type Env, type PaymentsConfig, type Services } from './settings.ts';
+import { mp3DurationSec, type TTS } from './tts.ts';
 
 const scrypt = promisify(scryptCb) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -93,6 +105,10 @@ export interface AppDeps {
   /** Сборка ИИ, озвучки и почты из настроек; в тестах подменяется. */
   reconfigure?: (env: Env) => Services;
   aiInfo?: { provider: string | null; model: string | null };
+  /** Цены платных действий; по умолчанию — значения из спецификации. */
+  pricing?: Pricing;
+  /** Платёжный шлюз; без него платные функции выключены и сервис работает как раньше. */
+  payments?: PaymentsConfig;
 }
 
 
@@ -191,6 +207,8 @@ const generateSchema = z
     background: z.boolean().default(false),
     /** Для фоновой задачи: сразу создать рассказы и озвучку для всех точек. */
     autoStories: z.boolean().default(false),
+    /** Цена, которую пользователь видел и подтвердил (для подбора сверх бесплатного лимита). */
+    expectedCost: z.number().int().min(0).optional(),
   })
   .refine((v) => (v.durationMin === undefined) !== (v.distanceM === undefined), {
     message: 'Укажите либо длительность, либо длину маршрута',
@@ -227,6 +245,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   let monthlyLimit = deps.routeMonthlyLimit ?? 5;
   let tiles = deps.tiles;
   let aiInfo = deps.aiInfo ?? { provider: ai ? 'custom' : null, model: null };
+  let pricing = deps.pricing ?? pricingFromEnv({});
+  let payments = deps.payments ?? paymentsFromEnv({});
   const applyServices = (s: Services) => {
     ai = s.ai;
     tts = s.tts;
@@ -235,6 +255,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     monthlyLimit = s.routeMonthlyLimit;
     tiles = s.tiles;
     aiInfo = { provider: s.aiProvider, model: s.aiModel };
+    pricing = s.pricing;
+    payments = s.payments;
   };
   const adminEmails = (deps.adminEmails ?? []).map((e) => e.toLowerCase());
   if (adminEmails.length) {
@@ -261,15 +283,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   await app.register(rateLimit, { global: false });
   await app.register(multipart, { limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 5 } });
 
-  await app.register(fastifyStatic, {
-    root: path.resolve(uploadsDir),
-    prefix: '/media/',
-    setHeaders(res) {
-      res.header('X-Content-Type-Options', 'nosniff');
-      res.header('Content-Security-Policy', "default-src 'none'; sandbox");
-      res.header('Cross-Origin-Resource-Policy', 'cross-origin');
-    },
-  });
+  // Только reply.sendFile: сами файлы отдаёт registerMedia, проверяя подпись у платных маршрутов.
+  await app.register(fastifyStatic, { root: path.resolve(uploadsDir), serve: false });
+  const mediaSigner = createMediaSigner(mediaSigningKey(db, deps.baseEnv ?? {}));
+  registerMedia(app, { db, signer: mediaSigner });
   await app.register(fastifyStatic, {
     root: path.join(here, '..', 'public'),
     prefix: '/map/',
@@ -302,10 +319,75 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const requireVerified = (req: FastifyRequest): User => {
     const user = requireUser(req);
     if (mailer && !user.emailVerified) {
-      throw new HttpError(403, `Подтвердите почту: ссылка в письме, отправленном на ${user.email}. Письмо можно отправить ещё раз в профиле.`);
+      throw new HttpError(
+        403,
+        `Подтвердите почту: ссылка в письме, отправленном на ${user.email}. Письмо можно отправить ещё раз в профиле.`,
+        'EMAIL_NOT_VERIFIED',
+      );
     }
     return user;
   };
+
+  const moneyCtx: MoneyContext = {
+    db,
+    requireUser,
+    requireVerified,
+    monthWindow,
+    pricing: () => pricing,
+    payments: () => payments,
+    mailer: () => mailer,
+    appUrl: () => appUrl,
+    log: app.log,
+    // Обёртки: canView и withOwned объявлены ниже и нужны только во время запросов.
+    routes: {
+      load: loadRouteRow,
+      owned: ownedRoute,
+      full: fullRoute,
+      canView: (row, viewer) => canView(row, viewer),
+      listedBy: (ownerId, viewer) =>
+        withOwned(
+          db
+            .prepare(
+              `SELECT ${ROUTE_COLUMNS} FROM routes r JOIN users u ON u.id = r.owner_id
+               WHERE r.owner_id = ? AND ${LISTED} ORDER BY r.created_at DESC LIMIT 200`,
+            )
+            .all(ownerId) as any[],
+          viewer,
+        ),
+    },
+  };
+  /** Платные действия включены, только когда подключён платёжный шлюз; иначе всё как до монетизации. */
+  const charging = () => !!payments.provider;
+
+  /** Списание из резерва за готовый результат: проводка «пользователь → выручка». */
+  function captureCharge(
+    holdId: string,
+    userId: string,
+    amount: number,
+    ref: { type: string; id: string },
+    meta: { title: string; routeId?: string; routeTitle?: string },
+    close = false,
+  ) {
+    tx(db, () =>
+      capture(
+        db,
+        holdId,
+        amount,
+        {
+          kind: 'charge',
+          actorId: userId,
+          refType: ref.type,
+          refId: ref.id,
+          meta,
+          entries: [
+            { account: userAccount(userId), amount: -amount },
+            { account: 'sys:revenue', amount },
+          ],
+        },
+        { close },
+      ),
+    );
+  }
 
   /** Свой лимит пользователя, иначе общий; 0 — без ограничения. */
   function limitOf(userId: string): number {
@@ -338,7 +420,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     };
   }
 
-  const publicUser = (user: User) => ({ ...user, quota: quotaOf(user.id) });
+  const publicUser = (user: User) => ({ ...user, quota: quotaOf(user.id), wallet: walletBrief(db, user.id) });
 
   async function sendVerification(user: { id: string; email: string; name: string }, log: FastifyRequest['log']) {
     if (!mailer) return;
@@ -362,7 +444,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (err instanceof ZodError) {
       return reply.status(400).send({ error: err.issues[0]?.message ?? 'Некорректный запрос' });
     }
-    if (err instanceof HttpError) return reply.status(err.status).send({ error: err.message });
+    if (err instanceof HttpError) {
+      return reply.status(err.status).send({ ...err.extra, error: err.message, ...(err.code ? { code: err.code } : {}) });
+    }
     if (err.statusCode === 429) return reply.status(429).send({ error: 'Слишком много запросов, подождите немного' });
     if (err.code === 'FST_REQ_FILE_TOO_LARGE') return reply.status(413).send({ error: 'Файл слишком большой' });
     if (err.statusCode && err.statusCode < 500) return reply.status(err.statusCode).send({ error: err.message });
@@ -396,12 +480,50 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     pointCount: r.point_count,
     rating: { avg: r.rating_avg === null ? null : Math.round(r.rating_avg * 10) / 10, count: r.rating_count },
     createdAt: r.created_at,
+    price: r.price ?? null,
   });
 
-  const serializeMedia = (m: any) => ({
+  /** Маршруты, открытые зрителем (куплены или свои): для пометки «Куплен» в списках. */
+  function withOwned(rows: any[], viewer: User | null) {
+    if (!viewer || !rows.length) return rows.map((r) => ({ ...summary(r), owned: false }));
+    const bought = new Set(
+      (
+        db
+          .prepare(`SELECT route_id FROM route_purchases WHERE user_id = ? AND route_id IN (${rows.map(() => '?').join(', ')})`)
+          .all(viewer.id, ...rows.map((r) => r.id)) as { route_id: string }[]
+      ).map((r) => r.route_id),
+    );
+    return rows.map((r) => ({ ...summary(r), owned: r.owner_id === viewer.id || bought.has(r.id) }));
+  }
+
+  /** Условие каталога: открыт, не удалён, бесплатный или одобренный платный (research R12). */
+  const LISTED = `r.is_public = 1 AND r.deleted_at IS NULL AND (r.price IS NULL OR r.sale_status = 'approved')`;
+
+  const purchased = (routeId: string, userId: string) =>
+    !!db.prepare('SELECT 1 FROM route_purchases WHERE route_id = ? AND user_id = ?').get(routeId, userId);
+
+  /**
+   * Доступ к маршруту (research R10): full — всё содержимое; preview — только превью платного маршрута;
+   * null — маршрута для зрителя нет. Покупатель сохраняет доступ при любых изменениях и удалении (FR-014).
+   */
+  function routeAccess(row: any, viewer: User | null): 'full' | 'preview' | null {
+    if (!row) return null;
+    const bought = !!viewer && purchased(row.id, viewer.id);
+    if (row.deleted_at) return bought || viewer?.isAdmin ? 'full' : null;
+    if (bought || viewer?.id === row.owner_id || viewer?.isAdmin) return 'full';
+    if (!row.is_public) return null;
+    if (row.price === null || row.price === undefined) return 'full';
+    return row.sale_status === 'approved' ? 'preview' : null;
+  }
+  const canView = (row: any, viewer: User | null) => routeAccess(row, viewer) === 'full';
+
+  /** Ссылка на файл; у платного маршрута — подписанная (зритель уже прошёл проверку доступа). */
+  const fileUrl = (file: string, paid: boolean) => (paid ? mediaSigner.sign(file) : `/media/${file}`);
+
+  const serializeMedia = (m: any, paid = false) => ({
     id: m.id,
     kind: m.kind,
-    url: `/media/${m.file_name}`,
+    url: fileUrl(m.file_name, paid),
     mime: m.mime,
     size: m.size,
     caption: m.caption,
@@ -413,6 +535,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       .get(id);
   }
 
+  /** Задача для клиента: с режимом оплаты, списанным и зарезервированным. */
+  function jobView(row: JobRow) {
+    const params = JSON.parse(row.params) as { billing?: 'free' | 'paid' };
+    const charged = (
+      db
+        .prepare(
+          `SELECT COALESCE(SUM(e.amount), 0) AS s FROM ledger_entries e JOIN ledger_tx t ON t.id = e.tx_id
+           WHERE t.ref_type = 'job' AND t.ref_id = ? AND e.account = 'sys:revenue'`,
+        )
+        .get(row.id) as { s: number }
+    ).s;
+    return { ...serializeJob(row), billing: params.billing ?? 'free', charged, reserved: findHold(db, 'job', row.id)?.amount ?? 0 };
+  }
+
   /** Задача по маршруту: идущая или закончившаяся за последние 15 минут. */
   function routeJob(routeId: string) {
     const row = db
@@ -421,10 +557,32 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
          ORDER BY created_at DESC LIMIT 1`,
       )
       .get(routeId, new Date(Date.now() - 15 * 60_000).toISOString()) as JobRow | undefined;
-    return row ? serializeJob(row) : null;
+    return row ? jobView(row) : null;
   }
 
   function fullRoute(row: any, viewer: User | null) {
+    const access = routeAccess(row, viewer);
+    if (access !== 'full') {
+      // Превью закрытого маршрута: без точек, линии и финиша; обложка — первое фото с автором и лицензией.
+      const first = db
+        .prepare('SELECT photo FROM points WHERE route_id = ? AND photo IS NOT NULL ORDER BY position LIMIT 1')
+        .get(row.id) as { photo: string } | undefined;
+      return {
+        ...summary(row),
+        finish: null,
+        locked: true,
+        owned: false,
+        cover: parseJson<PlacePhoto>(first?.photo ?? null),
+        geometry: null,
+        myRating: null,
+        isOwner: false,
+        canEdit: false,
+        job: null,
+        points: [],
+      };
+    }
+    const paid = row.price !== null && row.price !== undefined;
+    const staff = viewer?.id === row.owner_id || !!viewer?.isAdmin;
     const points = db.prepare('SELECT * FROM points WHERE route_id = ? ORDER BY position').all(row.id) as any[];
     const media = db
       .prepare(
@@ -443,6 +601,18 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       canEdit: viewer?.id === row.owner_id || !!viewer?.isAdmin,
       // Фоновая задача по маршруту: идущая или закончившаяся недавно (чтобы показать итог).
       job: viewer?.id === row.owner_id || viewer?.isAdmin ? routeJob(row.id) : null,
+      locked: false,
+      owned: !!viewer && (viewer.id === row.owner_id || purchased(row.id, viewer.id)),
+      deletedByAuthor: !!row.deleted_at,
+      // Автору и администратору — статус проверки и число покупателей.
+      ...(staff
+        ? {
+            sale: row.sale_status
+              ? { status: row.sale_status, note: row.sale_note ?? null, decidedAt: row.sale_decided_at ?? null }
+              : null,
+            buyers: (db.prepare('SELECT COUNT(*) AS n FROM route_purchases WHERE route_id = ?').get(row.id) as { n: number }).n,
+          }
+        : {}),
       points: points.map((p) => {
         const own = media.filter((m) => m.point_id === p.id);
         const narration = own.find((m) => m.is_narration);
@@ -459,8 +629,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           storySourceUrl: p.story_source_url,
           // Рассказы до появления выбора были фактическими.
           storyStyle: p.story_style ?? (p.story && p.story_source !== 'author' ? 'facts' : null),
-          narrationUrl: narration ? `/media/${narration.file_name}` : null,
-          media: own.filter((m) => !m.is_narration).map(serializeMedia),
+          narrationUrl: narration ? fileUrl(narration.file_name, paid) : null,
+          media: own.filter((m) => !m.is_narration).map((m) => serializeMedia(m, paid)),
           photo: parseJson<PlacePhoto>(p.photo),
           wikidata: p.wikidata ?? null,
           heritageRef: p.heritage_ref ?? null,
@@ -469,16 +639,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     };
   }
 
-  /** Чужие приватные маршруты неотличимы от несуществующих. */
+  /** Чужие приватные маршруты неотличимы от несуществующих; закрытый платный — виден превью. */
   function visibleRoute(id: string, viewer: User | null): any {
     const row = loadRouteRow(id);
-    if (!row || (!row.is_public && row.owner_id !== viewer?.id && !viewer?.isAdmin)) throw new HttpError(404, 'Маршрут не найден');
+    if (!routeAccess(row, viewer)) throw new HttpError(404, 'Маршрут не найден');
     return row;
   }
 
   function ownedRoute(id: string, user: User): any {
     const row = visibleRoute(id, user);
+    // Закрытый платный маршрут для постороннего — как несуществующий.
+    if (!canView(row, user)) throw new HttpError(404, 'Маршрут не найден');
     if (row.owner_id !== user.id && !user.isAdmin) throw new HttpError(403, 'Изменять маршрут может только автор');
+    // Удалённый автором маршрут (остался у покупателей) не правится.
+    if (row.deleted_at) throw new HttpError(404, 'Маршрут не найден');
     return row;
   }
 
@@ -625,7 +799,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const rows = db
       .prepare(
         `SELECT city AS name, COUNT(*) AS count, AVG(start_lat) AS lat, AVG(start_lng) AS lng
-         FROM routes WHERE is_public = 1 AND city IS NOT NULL AND city != ''
+         FROM routes r WHERE ${LISTED} AND city IS NOT NULL AND city != ''
          GROUP BY city ORDER BY count DESC, city LIMIT 100`,
       )
       .all() as any[];
@@ -802,22 +976,73 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return { token: createSession(row.id), user: publicUser(user) };
   });
 
+  /**
+   * Удаление аккаунта (research R11). Если у автора есть проданные маршруты, аккаунт обезличивается:
+   * проданные маршруты остаются у покупателей, остальные удаляются вместе с файлами. Иначе — удаляется
+   * полностью. Журнал баллов не удаляется никогда.
+   */
+  async function removeAccount(userId: string): Promise<'deleted' | 'anonymized'> {
+    const sold = db
+      .prepare('SELECT DISTINCT r.id FROM routes r JOIN route_purchases rp ON rp.route_id = r.id WHERE r.owner_id = ?')
+      .all(userId) as { id: string }[];
+    if (!sold.length) {
+      const files = db
+        .prepare('SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id JOIN routes r ON r.id = p.route_id WHERE r.owner_id = ?')
+        .all(userId) as any[];
+      db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+      await removeFiles(files.map((f) => f.file_name));
+      return 'deleted';
+    }
+    const keep = new Set(sold.map((r) => r.id));
+    const others = (db.prepare('SELECT id FROM routes WHERE owner_id = ?').all(userId) as { id: string }[]).filter((r) => !keep.has(r.id));
+    const files = others.length
+      ? (db
+          .prepare(
+            `SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id WHERE p.route_id IN (${others.map(() => '?').join(', ')})`,
+          )
+          .all(...others.map((r) => r.id)) as any[])
+      : [];
+    const hash = await hashPassword(randomBytes(32).toString('hex'));
+    const ts = now();
+    tx(db, () => {
+      for (const r of others) db.prepare('DELETE FROM routes WHERE id = ?').run(r.id);
+      // Проданные маршруты исчезают у автора и из каталога, но остаются у покупателей.
+      db.prepare('UPDATE routes SET deleted_at = COALESCE(deleted_at, ?), is_public = 0 WHERE owner_id = ?').run(ts, userId);
+      db.prepare(
+        `UPDATE users SET email = ?, name = 'Удалённый автор', password_hash = ?, role = 'user', deleted_at = ? WHERE id = ?`,
+      ).run(`deleted-${userId}@invalid`, hash, ts, userId);
+      for (const table of ['sessions', 'email_tokens', 'password_resets', 'ratings']) {
+        db.prepare(`DELETE FROM ${table} WHERE user_id = ?`).run(userId);
+      }
+    });
+    await removeFiles(files.map((f) => f.file_name));
+    return 'anonymized';
+  }
+
   /** Удаление своего аккаунта со всеми маршрутами, оценками и файлами. Нужен пароль. */
   app.delete('/api/me', authLimit, async (req, reply) => {
     const user = requireUser(req);
-    const { password } = z.object({ password: z.string().min(1, 'Введите пароль').max(200) }).parse(req.body ?? {});
+    const { password, force } = z
+      .object({ password: z.string().min(1, 'Введите пароль').max(200), force: z.boolean().default(false) })
+      .parse(req.body ?? {});
     const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id) as any;
     if (!(await checkPassword(password, row.password_hash))) throw new HttpError(403, 'Неверный пароль');
     if (user.isAdmin) {
       const admins = (db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND blocked_at IS NULL").get() as any).n;
       if (admins <= 1) throw new HttpError(409, 'Вы единственный администратор: сначала передайте права другому пользователю в админке.');
     }
-    const files = db
-      .prepare('SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id JOIN routes r ON r.id = p.route_id WHERE r.owner_id = ?')
-      .all(user.id) as any[];
-    db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
-    await removeFiles(files.map((f) => f.file_name));
-    req.log.info({ user: user.id }, 'пользователь удалил аккаунт');
+    // Баллы сгорают: сначала предупреждение и предложение вывести их (FR-030).
+    const openPayout = db.prepare("SELECT 1 FROM payout_requests WHERE user_id = ? AND status = 'open'").get(user.id);
+    if (!force && (available(db, user.id) > 0 || openPayout)) {
+      throw new HttpError(
+        409,
+        'На счёте остались баллы. После удаления аккаунта они пропадут: сначала оформите вывод или подтвердите удаление.',
+        'HAS_POINTS',
+        { balance: balanceOf(db, user.id) },
+      );
+    }
+    const result = await removeAccount(user.id);
+    req.log.info({ user: user.id, result }, 'пользователь удалил аккаунт');
     return reply.status(204).send();
   });
 
@@ -827,34 +1052,92 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   // ---------- Фоновые задачи ----------
 
-  /** Рассказы для точек без текста; redo — и для точек с рассказом другого направления (кроме текстов автора). */
-  async function storiesJob(job: JobRow, ctl: JobControl, routeId: string, params: { style?: string; redo?: boolean }) {
-    const route0 = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
-    if (!route0) throw new HttpError(404, 'Маршрут удалён');
-    const style = params.style ?? route0.story_style ?? 'facts';
-    const todo = routePoints(routeId).filter(
-      (p) => !p.story || (params.redo && p.story_source !== 'author' && (p.story_style ?? 'facts') !== style),
-    );
-    // После перезапуска сервера: готовые точки уже не в списке, счётчик продолжается.
-    let { done, failed } = job;
-    ctl.update({ stage: 'stories', total: done + todo.length });
-    for (const p of todo) {
-      if (!ctl.exists()) return;
-      const point = db.prepare('SELECT * FROM points WHERE id = ?').get(p.id) as any;
-      const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
-      if (!route) return;
-      if (point) {
-        try {
-          const res = await writePointStory(point, route, { style }, ctl.log);
-          res.notices.forEach((n) => ctl.notice(n));
-        } catch (err: any) {
-          failed++;
-          ctl.log.warn(err);
-          ctl.notice(`Не удалось создать рассказ для «${point.name}»: ${err?.status && err.status < 500 ? err.message : 'попробуйте ещё раз'}`);
+  /** Точки, для которых задача рассказов пишет текст: без рассказа; redo — и с рассказом другого направления (кроме текстов автора). */
+  const storyTodo = (routeId: string, style: string, redo: boolean) =>
+    routePoints(routeId).filter((p) => !p.story || (redo && p.story_source !== 'author' && (p.story_style ?? 'facts') !== style));
+
+  /** Оценка рассказов маршрута: текст + озвучка для каждой точки из storyTodo. */
+  function storiesQuote(route: any, style: string, redo: boolean) {
+    const items = storyTodo(route.id, style, redo).map((p) => ({
+      pointId: p.id as string,
+      ...storyItemQuote(pricing, { writeStory: true, withNarration: !!tts }),
+    }));
+    return { cost: quoteTotal(items), items };
+  }
+
+  /** Оценка для одной точки: новый текст (+ озвучка) или только озвучка текущего текста. */
+  const pointStoryQuote = (point: any, keepText: boolean): StoryQuoteItem =>
+    storyItemQuote(pricing, { writeStory: !keepText, textChars: (point.story ?? '').length, withNarration: !!tts });
+
+  /**
+   * Сколько списать за результат по точке: текст — если создан, озвучка — по фактической длительности,
+   * но не дороже оценки (FR-007); если длительность не определилась, — по оценке.
+   */
+  function pointCharge(res: { storyCreated: boolean; narrationSec: number | null }, est: StoryQuoteItem): number {
+    const story = res.storyCreated ? est.story : 0;
+    const narration =
+      res.narrationSec === null ? 0 : Math.min(res.narrationSec > 0 ? narrationCost(res.narrationSec, pricing) : est.narrationEstimate, est.narrationEstimate);
+    return story + narration;
+  }
+
+  interface StoriesParams {
+    style?: string;
+    redo?: boolean;
+    billing?: 'free' | 'paid';
+    /** Платная задача: точки и оценки, которые пользователь видел и подтвердил. */
+    pointIds?: string[];
+    estimates?: Record<string, StoryQuoteItem>;
+  }
+
+  /** Рассказы для точек маршрута; в платной задаче — списание по каждой точке из резерва задачи. */
+  async function storiesJob(job: JobRow, ctl: JobControl, routeId: string, params: StoriesParams) {
+    const paid = params.billing === 'paid';
+    try {
+      const route0 = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
+      if (!route0) throw new HttpError(404, 'Маршрут удалён');
+      const style = params.style ?? route0.story_style ?? 'facts';
+      let todo = storyTodo(routeId, style, !!params.redo);
+      // Платная задача делает только то, что было в подтверждённой цене.
+      if (paid) todo = todo.filter((p) => params.pointIds?.includes(p.id));
+      // После перезапуска сервера: готовые точки уже не в списке, счётчик продолжается.
+      let { done, failed } = job;
+      ctl.update({ stage: 'stories', total: done + todo.length });
+      for (const p of todo) {
+        if (!ctl.exists()) return;
+        const point = db.prepare('SELECT * FROM points WHERE id = ?').get(p.id) as any;
+        const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId) as any;
+        if (!route) return;
+        if (point) {
+          try {
+            const res = await writePointStory(point, route, { style }, ctl.log);
+            res.notices.forEach((n) => ctl.notice(n));
+            const h = paid ? findHold(db, 'job', job.id) : undefined;
+            const est = params.estimates?.[point.id];
+            if (h && est) {
+              const amount = Math.min(h.amount, pointCharge(res, est));
+              if (amount > 0) {
+                captureCharge(h.id, job.user_id, amount, { type: 'job', id: job.id }, {
+                  title: `Рассказ: ${point.name}`,
+                  routeId,
+                  routeTitle: route.title,
+                });
+              }
+            }
+          } catch (err: any) {
+            failed++;
+            ctl.log.warn(err);
+            ctl.notice(`Не удалось создать рассказ для «${point.name}»: ${err?.status && err.status < 500 ? err.message : 'попробуйте ещё раз'}`);
+          }
         }
+        done++;
+        ctl.update({ done, failed });
       }
-      done++;
-      ctl.update({ done, failed });
+    } finally {
+      // Остаток резерва — за точки, где ничего не создалось, и за озвучку дешевле оценки.
+      if (paid) {
+        const h = findHold(db, 'job', job.id);
+        if (h) release(db, h.id);
+      }
     }
   }
 
@@ -862,18 +1145,40 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     db,
     {
       generate: async (job, ctl) => {
-        const params = JSON.parse(job.params) as { request: z.infer<typeof generateSchema>; autoStories: boolean };
+        const params = JSON.parse(job.params) as {
+          request: z.infer<typeof generateSchema>;
+          autoStories: boolean;
+          billing?: 'free' | 'paid';
+          notices?: string[];
+        };
+        const paid = params.billing === 'paid';
         let routeId = job.route_id;
         if (!routeId) {
-          ctl.update({ stage: 'planning' });
-          const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(job.user_id);
-          if (!userRow) throw new HttpError(404, 'Пользователь удалён');
-          const built = await buildRoute(toUser(userRow), params.request, ctl.log);
-          built.notices.forEach((n) => ctl.notice(n));
-          routeId = built.id;
-          ctl.update({ route_id: routeId });
+          try {
+            ctl.update({ stage: 'planning' });
+            const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(job.user_id);
+            if (!userRow) throw new HttpError(404, 'Пользователь удалён');
+            const built = await buildRoute(toUser(userRow), params.request, ctl.log, { free: !paid });
+            built.notices.forEach((n) => ctl.notice(n));
+            params.notices?.forEach((n) => ctl.notice(n));
+            routeId = built.id;
+            ctl.update({ route_id: routeId });
+          } catch (err) {
+            // Маршрут не создан: резерв снимается, баллы возвращаются.
+            const h = paid ? findHold(db, 'job', job.id) : undefined;
+            if (h) release(db, h.id);
+            throw err;
+          }
         }
-        if (params.autoStories) await storiesJob({ ...job, route_id: routeId }, ctl, routeId, { style: params.request.storyStyle });
+        // После перезапуска резерв уже списан и не находится: второго списания нет.
+        const h = paid ? findHold(db, 'job', job.id) : undefined;
+        if (h) {
+          const title = (db.prepare('SELECT title FROM routes WHERE id = ?').get(routeId) as any)?.title ?? '';
+          captureCharge(h.id, job.user_id, h.amount, { type: 'job', id: job.id }, { title: 'Подбор маршрута', routeId, routeTitle: title }, true);
+        }
+        if (params.autoStories && !paid) {
+          await storiesJob({ ...job, route_id: routeId }, ctl, routeId, { style: params.request.storyStyle, billing: 'free' });
+        }
       },
       stories: async (job, ctl) => {
         if (!job.route_id) throw new HttpError(404, 'Маршрут удалён');
@@ -896,7 +1201,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.get('/api/jobs/:id', async (req) => {
     const user = requireUser(req);
     const { id } = paramsId.parse(req.params);
-    return { job: serializeJob(ownedJob(id, user)) };
+    return { job: jobView(ownedJob(id, user)) };
   });
 
   /** Идущие задачи и закончившиеся за последний час: для списка «Мои». */
@@ -907,7 +1212,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         `SELECT * FROM jobs WHERE user_id = ? AND (status IN ('queued', 'running') OR updated_at > ?) ORDER BY created_at DESC LIMIT 20`,
       )
       .all(user.id, new Date(Date.now() - 60 * 60_000).toISOString()) as unknown as JobRow[];
-    return { jobs: rows.map(serializeJob) };
+    return { jobs: rows.map(jobView) };
   });
 
   /** Рассказы для всех точек маршрута в фоне. Если задача по маршруту уже идёт — она и возвращается. */
@@ -917,22 +1222,81 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     async (req, reply) => {
       const user = requireUser(req);
       const { id } = paramsId.parse(req.params);
-      const body = z.object({ style: storyStyleSchema.optional(), redo: z.boolean().default(false) }).parse(req.body ?? {});
+      const body = z
+        .object({ style: storyStyleSchema.optional(), redo: z.boolean().default(false), expectedCost: z.number().int().min(0).optional() })
+        .parse(req.body ?? {});
       const route = ownedRoute(id, user);
       const running = db
         .prepare("SELECT * FROM jobs WHERE route_id = ? AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1")
         .get(id) as JobRow | undefined;
-      if (running) return reply.status(202).send({ job: serializeJob(running) });
-      const job = jobs.enqueue(user.id, 'stories', { style: body.style ?? route.story_style ?? 'facts', redo: body.redo }, id);
-      return reply.status(202).send({ job: serializeJob(job) });
+      if (running) return reply.status(202).send({ job: jobView(running), cost: 0 });
+      const style = body.style ?? route.story_style ?? 'facts';
+      const jobId = randomUUID();
+      let params: StoriesParams = { style, redo: body.redo, billing: 'free' };
+      let cost = 0;
+      if (charging()) {
+        requireSpender(moneyCtx, req);
+        const quote = storiesQuote(route, style, body.redo);
+        checkExpected(quote.cost, body.expectedCost);
+        cost = quote.cost;
+        params = {
+          ...params,
+          billing: 'paid',
+          pointIds: quote.items.map((i) => i.pointId),
+          estimates: Object.fromEntries(quote.items.map((i) => [i.pointId, { story: i.story, narrationEstimate: i.narrationEstimate }])),
+        };
+        // Резерв до постановки задачи: обработчик начинает работу сразу и должен его найти.
+        if (cost > 0) tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'job', refId: jobId }));
+      }
+      const job = jobs.enqueue(user.id, 'stories', params, id, jobId);
+      return reply.status(202).send({ job: jobView(job), cost });
     },
   );
+
+  app.get('/api/routes/:id/stories/quote', async (req) => {
+    const user = requireUser(req);
+    const { id } = paramsId.parse(req.params);
+    const q = z.object({ style: storyStyleSchema.optional(), redo: z.enum(['true', 'false']).optional() }).parse(req.query);
+    const route = ownedRoute(id, user);
+    const quote = storiesQuote(route, q.style ?? route.story_style ?? 'facts', q.redo === 'true');
+    return { cost: charging() ? quote.cost : 0, points: quote.items.length, items: charging() ? quote.items : [] };
+  });
+
+  /** Бесплатен ли подбор (в пределах месячного лимита) и сколько он стоит сверх лимита. */
+  function generationQuote(userId: string, target: { durationMin: number } | { distanceM: number }, roundTrip: boolean) {
+    const quota = quotaOf(userId);
+    const free = quota.remaining !== 0;
+    return {
+      free,
+      freeLeft: quota.remaining,
+      limit: quota.limit,
+      cost: free ? 0 : routeCost(routeMinutes(target, roundTrip), pricing),
+      paymentsEnabled: charging(),
+    };
+  }
+
+  app.get('/api/routes/quote', async (req) => {
+    const user = requireUser(req);
+    const q = z
+      .object({
+        durationMin: z.coerce.number().min(15).max(480).optional(),
+        distanceM: z.coerce.number().min(300).max(30_000).optional(),
+        roundTrip: z.enum(['true', 'false']).default('true'),
+      })
+      .refine((v) => (v.durationMin === undefined) !== (v.distanceM === undefined), {
+        message: 'Укажите либо длительность, либо длину маршрута',
+      })
+      .parse(req.query);
+    const target = q.durationMin !== undefined ? { durationMin: q.durationMin } : { distanceM: q.distanceM! };
+    return generationQuote(user.id, target, q.roundTrip === 'true');
+  });
 
   /** Подбор мест и запись маршрута; бросает HttpError, если мест нет или источники недоступны. */
   async function buildRoute(
     user: User,
     body: z.infer<typeof generateSchema>,
     log: FastifyBaseLogger,
+    opts: { free: boolean } = { free: true },
   ): Promise<{ id: string; notices: string[] }> {
     const target =
       body.durationMin !== undefined ? { durationMin: body.durationMin } : { distanceM: body.distanceM! };
@@ -1015,6 +1379,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         });
       });
       db.prepare('INSERT INTO route_generations (user_id, created_at) VALUES (?, ?)').run(user.id, ts);
+      // Маршрут в бесплатном лимите: рассказы и озвучка при создании тоже бесплатны.
+      if (opts.free) db.prepare('UPDATE routes SET free_generation = 1 WHERE id = ?').run(id);
     });
     return { id, notices: plan.notices };
   }
@@ -1026,11 +1392,22 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       const user = requireVerified(req);
       const body = generateSchema.parse(req.body);
       const before = quotaOf(user.id);
-      if (before.remaining === 0) {
+      const free = before.remaining !== 0;
+      if (!free && !charging()) {
         throw new HttpError(
           429,
           `В этом месяце создано ${before.used} из ${before.limit} маршрутов. Новые можно будет создать с ${ruDate(new Date(before.resetsAt))}. Пока можно менять уже созданные маршруты: добавлять места и менять порядок.`,
         );
+      }
+      // Сверх бесплатного лимита — за баллы: цена подтверждена пользователем и зарезервирована.
+      let cost = 0;
+      const extraNotices: string[] = [];
+      if (!free) {
+        requireSpender(moneyCtx, req);
+        const target = body.durationMin !== undefined ? { durationMin: body.durationMin } : { distanceM: body.distanceM! };
+        cost = routeCost(routeMinutes(target, body.roundTrip), pricing);
+        checkExpected(cost, body.expectedCost);
+        if (body.autoStories) extraNotices.push('Рассказы для мест можно заказать после создания маршрута: цена будет видна заранее.');
       }
       if (body.background) {
         const active = (
@@ -1039,11 +1416,37 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         if (active >= MAX_ACTIVE_JOBS) {
           throw new HttpError(429, `Уже строится ${active} маршрута. Дождитесь, пока они будут готовы.`);
         }
-        const job = jobs.enqueue(user.id, 'generate', { request: body, autoStories: body.autoStories });
-        return reply.status(202).send({ job: serializeJob(job), quota: quotaOf(user.id) });
+        const jobId = randomUUID();
+        // Резерв до постановки задачи: обработчик начинает работу сразу и должен его найти.
+        const h = cost > 0 ? tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'job', refId: jobId })) : null;
+        let job: JobRow;
+        try {
+          job = jobs.enqueue(
+            user.id,
+            'generate',
+            { request: body, autoStories: free && body.autoStories, billing: free ? 'free' : 'paid', notices: extraNotices },
+            null,
+            jobId,
+          );
+        } catch (err) {
+          if (h) release(db, h.id);
+          throw err;
+        }
+        return reply.status(202).send({ job: jobView(job), quota: quotaOf(user.id) });
       }
-      const { id, notices } = await buildRoute(user, body, req.log);
-      return reply.status(201).send({ route: fullRoute(loadRouteRow(id), user), notices, quota: quotaOf(user.id) });
+      const h = cost > 0 ? tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'request', refId: randomUUID() })) : null;
+      let built: { id: string; notices: string[] };
+      try {
+        built = await buildRoute(user, body, req.log, { free });
+      } catch (err) {
+        if (h) release(db, h.id);
+        throw err;
+      }
+      const row = loadRouteRow(built.id);
+      if (h) captureCharge(h.id, user.id, cost, { type: 'route', id: built.id }, { title: 'Подбор маршрута', routeId: built.id, routeTitle: row.title }, true);
+      return reply
+        .status(201)
+        .send({ route: fullRoute(row, user), notices: [...built.notices, ...extraNotices], quota: quotaOf(user.id) });
     },
   );
 
@@ -1105,7 +1508,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       })
       .parse(req.query);
 
-    const where = ['r.is_public = 1'];
+    const where = [LISTED];
     const args: (string | number)[] = [];
     if (q.q) {
       const like = `%${q.q.replace(/[\\%_]/g, '\\$&')}%`;
@@ -1132,8 +1535,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         `SELECT ${ROUTE_COLUMNS} FROM routes r JOIN users u ON u.id = r.owner_id
          WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT ? OFFSET ?`,
       )
-      .all(...args, q.limit, q.offset);
-    return { routes: rows.map(summary) };
+      .all(...args, q.limit, q.offset) as any[];
+    return { routes: withOwned(rows, req.user) };
   });
 
   app.get('/api/routes/mine', async (req) => {
@@ -1141,10 +1544,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const rows = db
       .prepare(
         `SELECT ${ROUTE_COLUMNS} FROM routes r JOIN users u ON u.id = r.owner_id
-         WHERE r.owner_id = ? ORDER BY r.created_at DESC LIMIT 200`,
+         WHERE r.owner_id = ? AND r.deleted_at IS NULL ORDER BY r.created_at DESC LIMIT 200`,
       )
-      .all(user.id);
-    return { routes: rows.map(summary) };
+      .all(user.id) as any[];
+    return { routes: withOwned(rows, user) };
   });
 
   app.get('/api/routes/:id', async (req) => {
@@ -1185,6 +1588,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const user = requireUser(req);
     const { id } = paramsId.parse(req.params);
     ownedRoute(id, user);
+    // Есть покупатели — маршрут остаётся у них (FR-014): скрывается, файлы не удаляются (research R11).
+    if (db.prepare('SELECT 1 FROM route_purchases WHERE route_id = ? LIMIT 1').get(id)) {
+      db.prepare('UPDATE routes SET deleted_at = ?, is_public = 0, updated_at = ? WHERE id = ?').run(now(), now(), id);
+      return reply.status(204).send();
+    }
     const files = db
       .prepare('SELECT m.file_name FROM media m JOIN points p ON p.id = m.point_id WHERE p.route_id = ?')
       .all(id) as any[];
@@ -1199,6 +1607,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const { value } = z.object({ value: z.number().int().min(1).max(5) }).parse(req.body);
     const row = visibleRoute(id, user);
     if (row.owner_id === user.id) throw new HttpError(403, 'Нельзя оценивать собственный маршрут');
+    // Платный маршрут оценивают только открывшие его (FR-017).
+    if (!canView(row, user)) throw new HttpError(403, 'Оценить маршрут можно после того, как вы его откроете');
     if (!row.is_public) throw new HttpError(404, 'Маршрут не найден');
     db.prepare(
       `INSERT INTO ratings (route_id, user_id, value, updated_at) VALUES (?, ?, ?, ?)
@@ -1437,6 +1847,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const { id } = paramsId.parse(req.params);
     const { format } = z.object({ format: z.enum(['gpx', 'kml']) }).parse(req.query);
     const row = visibleRoute(id, req.user);
+    if (!canView(row, req.user)) throw new HttpError(404, 'Маршрут не найден');
     const data = {
       title: row.title,
       description: row.description,
@@ -1492,7 +1903,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         `SELECT p.*,
            (SELECT m.file_name FROM media m WHERE m.point_id = p.id AND m.is_narration = 1 AND m.voice = ?) AS narration_file
          FROM points p JOIN routes r ON r.id = p.route_id
-         WHERE p.id != ? AND r.lang = ? AND p.story_style = ? AND p.story IS NOT NULL AND p.story_version >= ?
+         WHERE p.id != ? AND r.price IS NULL AND r.lang = ? AND p.story_style = ? AND p.story IS NOT NULL AND p.story_version >= ?
            AND p.story_source IN (${SHARED_SOURCES.map(() => '?').join(', ')})
            AND (${keys.join(' OR ')})
          ORDER BY narration_file IS NULL, r.updated_at DESC
@@ -1520,7 +1931,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     route: any,
     opts: { keepText?: boolean; fresh?: boolean; style?: string },
     log: FastifyBaseLogger,
-  ): Promise<{ notices: string[]; reused: boolean }> {
+  ): Promise<{ notices: string[]; reused: boolean; storyCreated: boolean; narrationSec: number | null }> {
     const id: string = point.id;
     const keepText = !!opts.keepText;
     const body = { fresh: !!opts.fresh, style: opts.style };
@@ -1650,6 +2061,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       await dropNarration(id);
     }
 
+    // Длительность озвучки — для цены по факту; null — озвучки нет.
+    let narrationSec: number | null = null;
     if (tts) {
       try {
         if (sharedNarration) {
@@ -1658,12 +2071,14 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
             await copyFile(from, to);
             return (await stat(to)).size;
           });
+          narrationSec = mp3DurationSec(await readFile(from));
         } else {
           const audio = await tts.synthesize(story);
           await saveNarration(id, async (to) => {
             await writeFile(to, audio);
             return audio.length;
           });
+          narrationSec = mp3DurationSec(audio);
         }
       } catch (err) {
         log.error(err);
@@ -1682,7 +2097,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       }
     }
     touchRoute(route.id);
-    return { notices, reused };
+    return { notices, reused, storyCreated: !keepText, narrationSec };
   }
 
   app.post(
@@ -1697,14 +2112,51 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           style: storyStyleSchema.optional(),
           /** true — «Создать заново»: написать новый текст, а не брать готовый из другого маршрута. */
           fresh: z.boolean().default(false),
+          expectedCost: z.number().int().min(0).optional(),
         })
         .parse(req.body ?? {});
       const { keepText } = body;
       const { point, route } = ownedPoint(id, user);
-      const { notices, reused } = await writePointStory(point, route, { keepText, fresh: body.fresh, style: body.style }, req.log);
-      return { route: fullRoute(loadRouteRow(route.id), user), notices, reused };
+      let h: ReturnType<typeof hold> | null = null;
+      let est: StoryQuoteItem = { story: 0, narrationEstimate: 0 };
+      if (charging()) {
+        requireSpender(moneyCtx, req);
+        est = pointStoryQuote(point, keepText);
+        const cost = est.story + est.narrationEstimate;
+        checkExpected(cost, body.expectedCost);
+        if (cost > 0) h = tx(db, () => hold(db, { userId: user.id, kind: 'charge', amount: cost, refType: 'point', refId: randomUUID() }));
+      }
+      let result: Awaited<ReturnType<typeof writePointStory>>;
+      try {
+        result = await writePointStory(point, route, { keepText, fresh: body.fresh, style: body.style }, req.log);
+      } catch (err) {
+        if (h) release(db, h.id);
+        throw err;
+      }
+      let charged = 0;
+      if (h) {
+        charged = Math.min(h.amount, pointCharge(result, est));
+        if (charged > 0) {
+          captureCharge(h.id, user.id, charged, { type: 'point', id: point.id }, {
+            title: keepText ? `Озвучка: ${point.name}` : `Рассказ: ${point.name}`,
+            routeId: route.id,
+            routeTitle: route.title,
+          }, true);
+        } else release(db, h.id);
+      }
+      const { notices, reused } = result;
+      return { route: fullRoute(loadRouteRow(route.id), user), notices, reused, charged };
     },
   );
+
+  app.get('/api/points/:id/story/quote', async (req) => {
+    const user = requireUser(req);
+    const { id } = paramsId.parse(req.params);
+    const { keepText } = z.object({ keepText: z.enum(['true', 'false']).default('false') }).parse(req.query);
+    const { point } = ownedPoint(id, user);
+    const q = charging() ? pointStoryQuote(point, keepText === 'true') : { story: 0, narrationEstimate: 0 };
+    return { cost: q.story + q.narrationEstimate, story: q.story, narrationEstimate: q.narrationEstimate };
+  });
 
   // ---------- Ссылка на маршрут ----------
 
@@ -1733,7 +2185,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const parsed = paramsId.safeParse(req.params);
     const row = parsed.success ? loadRouteRow(parsed.data.id) : null;
     let page = html;
-    if (row?.is_public) {
+    // Превью для мессенджеров — только у маршрутов из каталога; у платных — без содержимого.
+    if (row && routeAccess(row, null)) {
       const first = db
         .prepare('SELECT photo FROM points WHERE route_id = ? AND photo IS NOT NULL ORDER BY position LIMIT 1')
         .get(row.id) as any;
@@ -1806,6 +2259,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return { route: fullRoute(loadRouteRow(route.id), user) };
   });
 
+  const money = registerMoney(app, moneyCtx);
+
   registerAdmin(app, {
     db,
     monthWindow,
@@ -1825,6 +2280,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       appUrl,
     }),
     mailer: () => mailer,
+    fullRoute,
+    loadRoute: loadRouteRow,
+    removeAccount,
+    money,
   });
 
   return app;

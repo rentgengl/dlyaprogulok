@@ -2,6 +2,7 @@ import * as Location from 'expo-location';
 import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import { pluralPoints, usePriceConfirm } from '@/components/PriceConfirm';
 import { RouteMap } from '@/components/RouteMap';
 import { Banner, Button, Chip, Field, layout, SignInPrompt } from '@/components/ui';
 import { VerifyEmailCard } from '@/components/VerifyEmail';
@@ -10,7 +11,9 @@ import { useAuth } from '@/lib/auth';
 import { useCity } from '@/lib/city';
 import { formatDistance, formatDuration, quotaText } from '@/lib/format';
 import { colors, radius, space } from '@/lib/theme';
-import { STORY_STYLE_LABEL, type GeocodeResult, type Job, type LatLng, type StoryStyle } from '@/lib/types';
+import { STORY_STYLE_LABEL, type GeocodeResult, type Job, type LatLng, type Quote, type StoryStyle } from '@/lib/types';
+
+type RouteQuote = Quote & { free: boolean; paymentsEnabled: boolean };
 
 const DURATIONS = [30, 60, 90, 120, 180];
 const DISTANCES = [1000, 2000, 3000, 5000, 8000];
@@ -39,6 +42,23 @@ export default function CreateScreen() {
   const [error, setError] = useState<string | null>(null);
   /** Подбор идёт на сервере: ждём, пока в задаче появится маршрут. */
   const [pending, setPending] = useState<Job | null>(null);
+  /** Цена подбора с текущими параметрами: бесплатно в пределах лимита или за баллы. */
+  const [quote, setQuote] = useState<RouteQuote | null>(null);
+  const priceConfirm = usePriceConfirm();
+  const target = mode === 'duration' ? { durationMin: duration } : { distanceM: distance };
+
+  useEffect(() => {
+    if (!user || kind !== 'auto') return;
+    let off = false;
+    api
+      .routeQuote({ ...target, roundTrip })
+      .then((q) => !off && setQuote(q))
+      .catch(() => {});
+    return () => {
+      off = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, user?.quota.used, kind, mode, duration, distance, roundTrip]);
 
   useEffect(() => {
     if (!pending) return;
@@ -75,8 +95,19 @@ export default function CreateScreen() {
   }
 
   const quota = quotaText(user.quota);
-  // Лимит исчерпан или почта не подтверждена: сервер всё равно откажет, кнопку лучше выключить сразу.
-  const blocked = !user.emailVerified || (kind === 'auto' && user.quota.remaining === 0);
+  /** Бесплатный лимит исчерпан, но новый маршрут можно оплатить баллами. */
+  const paid = kind === 'auto' && user.quota.remaining === 0 && !!quote?.paymentsEnabled;
+  // Лимит исчерпан (и платежи выключены) или почта не подтверждена: сервер всё равно откажет.
+  const blocked = !user.emailVerified || (kind === 'auto' && user.quota.remaining === 0 && !paid);
+  const priceText = !quote
+    ? quota
+    : quote.free
+      ? quote.limit !== null && quote.limit !== undefined
+        ? `Бесплатно: в этом месяце осталось ${quote.freeLeft} из ${quote.limit}.`
+        : null
+      : quote.paymentsEnabled
+        ? `Бесплатные маршруты в этом месяце закончились. Этот маршрут — ${pluralPoints(quote.cost)}.`
+        : quota;
 
   const runSearch = async () => {
     if (search.trim().length < 2) return;
@@ -107,25 +138,53 @@ export default function CreateScreen() {
     }
   };
 
-  const generate = async () => {
+  /** Запуск подбора; expectedCost — подтверждённая цена платного маршрута. Ошибки пробрасываются. */
+  const startGenerate = async (free: boolean, expectedCost?: number) => {
     if (!start) return;
     setBusy(true);
-    setError(null);
     try {
       const label = start.label === 'Моё местоположение' ? undefined : start.label;
       const { job, quota } = await api.generateInBackground({
         start: { lat: start.lat, lng: start.lng, label },
-        ...(mode === 'duration' ? { durationMin: duration } : { distanceM: distance }),
+        ...target,
         roundTrip,
         interests: interests.trim() || undefined,
         storyStyle,
-        autoStories,
+        // Рассказы сразу — только для бесплатного маршрута; для платного их заказывают отдельно.
+        autoStories: free && autoStories,
+        expectedCost,
       });
       setUser({ ...user, quota });
       setPending(job);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Не удалось построить маршрут');
       setBusy(false);
+      throw err;
+    }
+  };
+
+  const generate = async () => {
+    if (!start) return;
+    setError(null);
+    let q = quote;
+    try {
+      q = await api.routeQuote({ ...target, roundTrip });
+      setQuote(q);
+    } catch {
+      // Цену не узнали — сервер сам ответит, если маршрут платный.
+    }
+    try {
+      if (q && !q.free && q.paymentsEnabled) {
+        await priceConfirm.run({
+          title: mode === 'duration' ? `Маршрут на ${formatDuration(duration)}` : `Маршрут на ${formatDistance(distance)}`,
+          cost: q.cost,
+          note: 'Рассказы и озвучку для мест можно заказать после создания маршрута, цена будет видна заранее.',
+          perform: (cost) => startGenerate(false, cost),
+        });
+      } else {
+        await startGenerate(true);
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Не удалось построить маршрут');
     }
   };
 
@@ -176,7 +235,7 @@ export default function CreateScreen() {
             : 'Задайте старт и название, а места добавите сами: поиском, из списка мест рядом или нажатием на карту. Рассказы можно написать самому. Месячный лимит не расходуется.'}
         </Text>
       </View>
-      {kind === 'auto' && user.quota.remaining === 0 && quota ? <Banner tone="info" text={quota} /> : null}
+      {kind === 'auto' && user.quota.remaining === 0 && priceText ? <Banner tone="info" text={priceText} /> : null}
       <Section number={1} title="Откуда начнём?">
         <View style={styles.searchRow}>
           <View style={{ flex: 1 }}>
@@ -295,13 +354,20 @@ export default function CreateScreen() {
               : 'Предания, городские легенды и поверья — с пометкой, где легенда, а где факт.'}
           </Text>
         </View>
-        <View style={styles.switchRow}>
-          <View style={{ flex: 1 }}>
-            <Text style={layout.body}>Сразу создать аудиорассказы</Text>
-            <Text style={layout.muted}>Для каждой остановки, это займёт пару минут</Text>
+        {paid ? (
+          <Text style={layout.muted}>Рассказы и озвучку для мест можно будет заказать после создания маршрута, цена будет видна заранее.</Text>
+        ) : (
+          <View style={styles.switchRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={layout.body}>Сразу создать аудиорассказы</Text>
+              <Text style={layout.muted}>
+                Для каждой остановки, это займёт пару минут.
+                {quote?.paymentsEnabled ? ' Рассказы и озвучка бесплатны только при создании маршрута.' : ''}
+              </Text>
+            </View>
+            <Switch value={autoStories} onValueChange={setAutoStories} trackColor={{ true: colors.forest }} />
           </View>
-          <Switch value={autoStories} onValueChange={setAutoStories} trackColor={{ true: colors.forest }} />
-        </View>
+        )}
       </Section>
 
       </>
@@ -310,9 +376,9 @@ export default function CreateScreen() {
       {error ? <Banner text={error} /> : null}
       {kind === 'auto' ? (
         <>
-          {quota ? <Text style={[layout.muted, { textAlign: 'center' }]}>{quota}</Text> : null}
+          {priceText ? <Text style={[layout.muted, { textAlign: 'center' }]}>{priceText}</Text> : null}
           <Button
-            title={busy ? 'Подбираем места и прокладываем путь…' : 'Построить маршрут'}
+            title={busy ? 'Подбираем места и прокладываем путь…' : paid && quote ? `Построить за ${pluralPoints(quote.cost)}` : 'Построить маршрут'}
             icon={busy ? undefined : 'sparkles'}
             onPress={generate}
             loading={busy}
@@ -338,6 +404,7 @@ export default function CreateScreen() {
       ) : kind === 'manual' && !title.trim() ? (
         <Text style={[layout.muted, { textAlign: 'center' }]}>Укажите название</Text>
       ) : null}
+      {priceConfirm.element}
     </ScrollView>
   );
 }

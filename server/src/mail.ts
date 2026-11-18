@@ -79,3 +79,56 @@ export function passwordResetMail(to: string, name: string, link: string): Mail 
 <p style="color:#666">Или откройте ссылку: ${escapeHtml(link)}<br>Ссылка действует 1 час. Если вы не просили сбросить пароль, просто удалите это письмо: пароль останется прежним.</p>`;
   return { to, subject: 'Сброс пароля в «Для прогулок»', text, html };
 }
+
+export type SaleDecision = 'approve' | 'reject' | 'delist';
+
+/** Решение администратора по платному маршруту (FR-012a, FR-012b). */
+export function saleDecisionMail(
+  to: string,
+  name: string,
+  routeTitle: string,
+  decision: SaleDecision,
+  note: string | null,
+  link: string,
+): Mail {
+  const subject = {
+    approve: `Маршрут «${routeTitle}» одобрен для продажи`,
+    reject: `Маршрут «${routeTitle}» не прошёл проверку`,
+    delist: `Маршрут «${routeTitle}» снят с продажи`,
+  }[decision];
+  const body = {
+    approve: 'Маршрут проверен и опубликован в каталоге как платный. Покупатели смогут открыть его за баллы.',
+    reject: 'Маршрут не прошёл проверку и остался приватным и бесплатным. Можно исправить его и отправить на проверку снова.',
+    delist: 'Маршрут снят с продажи и скрыт из каталога. Те, кто уже открыл его, сохраняют доступ.',
+  }[decision];
+  const text = [`${name}, здравствуйте!`, '', body, ...(note ? ['', `Комментарий администратора: ${note}`] : []), '', link].join('\n');
+  const html = `<p>${escapeHtml(name)}, здравствуйте!</p>
+<p>${escapeHtml(body)}</p>
+${note ? `<p>Комментарий администратора: ${escapeHtml(note)}</p>` : ''}
+<p><a href="${escapeHtml(link)}">${escapeHtml(routeTitle)}</a></p>`;
+  return { to, subject, text, html };
+}
+
+/** Решение по заявке на вывод (FR-024b). */
+export function payoutDecisionMail(
+  to: string,
+  name: string,
+  decision: 'paid' | 'rejected',
+  points: number,
+  payoutRub: number,
+  note: string,
+  link: string,
+): Mail {
+  const rub = payoutRub.toLocaleString('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  const body =
+    decision === 'paid'
+      ? `Заявка на вывод ${points} баллов выполнена: к выплате ${rub} ₽ по договору.`
+      : `Заявка на вывод ${points} баллов отклонена. Баллы вернулись на счёт.`;
+  const label = decision === 'paid' ? 'Комментарий о переводе' : 'Причина';
+  const text = [`${name}, здравствуйте!`, '', body, '', `${label}: ${note}`, '', link].join('\n');
+  const html = `<p>${escapeHtml(name)}, здравствуйте!</p>
+<p>${escapeHtml(body)}</p>
+<p>${label}: ${escapeHtml(note)}</p>
+<p><a href="${escapeHtml(link)}">Баллы в «Для прогулок»</a></p>`;
+  return { to, subject: decision === 'paid' ? 'Вывод баллов выполнен' : 'Заявка на вывод отклонена', text, html };
+}

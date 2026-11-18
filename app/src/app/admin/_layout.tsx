@@ -22,6 +22,9 @@ export default function AdminLayout() {
     >
       <Stack.Screen name="index" options={{ title: 'Админка · обзор' }} />
       <Stack.Screen name="routes" options={{ title: 'Админка · маршруты' }} />
+      <Stack.Screen name="paid-routes" options={{ title: 'Админка · платные маршруты' }} />
+      <Stack.Screen name="payouts" options={{ title: 'Админка · вывод баллов' }} />
+      <Stack.Screen name="money" options={{ title: 'Админка · деньги' }} />
       <Stack.Screen name="users/index" options={{ title: 'Админка · пользователи' }} />
       <Stack.Screen name="users/[id]" options={{ title: 'Админка · пользователь' }} />
       <Stack.Screen name="settings" options={{ title: 'Админка · настройки' }} />
